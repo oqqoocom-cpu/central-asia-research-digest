@@ -1,0 +1,32 @@
+name: 新增或修复来源适配器
+description: 报告一个高质量中亚研究来源或现有适配器问题
+title: "[来源适配器] "
+labels:
+  - source-adapter
+body:
+  - type: input
+    id: publisher
+    attributes:
+      label: 出版方或机构
+      description: 请填写机构正式名称。
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: 公开入口
+      description: RSS、API、出版物索引、站点地图或公开全文 URL。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 质量依据
+      description: 说明研究类型、权威性、中亚关联和公开访问情况。
+    validations:
+      required: true
+  - type: textarea
+    id: access
+    attributes:
+      label: 访问限制
+      description: 说明是否存在 403、429、登录、付费墙、验证码或 robots 限制。

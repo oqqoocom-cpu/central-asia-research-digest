@@ -1,0 +1,14 @@
+{
+  "date": "",
+  "output_dir": "",
+  "stable_mode": true,
+  "candidate_sources": true,
+  "translation": true,
+  "verify_tls": true,
+  "enable_gdelt": false,
+  "min_host_interval": 0.25,
+  "request_timeout": 15,
+  "user_agent": "CentralAsiaResearchDigest/2.0 (+mailto:you@example.org)",
+  "openalex_api_key": "",
+  "crossref_mailto": "you@example.org"
+}

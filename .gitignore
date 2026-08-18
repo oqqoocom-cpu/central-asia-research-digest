@@ -1,0 +1,45 @@
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Secrets and machine-local configuration
+.env
+.env.*
+config.json
+*.local.json
+
+# Runtime caches and discovery state
+.cache.json
+.translation_cache.json
+.google_news_resolve_cache.json
+.daily_selection_*.json
+.daily_render_*.md
+candidate_source_history.json
+seen_item_history.json
+source_health_*.log
+selection_audit_*.json
+*.tmp
+
+# Generated editions and internal working files
+CentralAsia_Research_*.md
+CentralAsia_Digest_*.md
+CentralAsia_Internal_Review_*.md
+_test_*.txt
+_*_out.txt
+digest_run_*.log
+wait_err.log
+
+# One-off migration, patch and diagnostic scripts. Keep the maintained test.
+_*.py
+!_test_source_diversity.py
+_*.txt
+_*.json
+AGENTS.md
+豆包参考.txt
+信息源对照_豆包73.md
+跨电脑迁移说明.md
+使用说明.txt
