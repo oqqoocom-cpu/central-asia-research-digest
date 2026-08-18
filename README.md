@@ -5,6 +5,8 @@
 维护者：**薛定谔与海森堡**（GitHub：`@oqqoocom-cpu`）  
 许可证：Apache License 2.0（代码与项目文档）
 
+项目仓库：[Central Asia Research Digest](https://github.com/oqqoocom-cpu/central-asia-research-digest)
+
 面向专业中亚区域国别研究者的每日深度阅读清单。目标不是“抓到多少算多少”，而是在约 1 小时阅读时间内，筛出最新、最深度、最有研究价值的报道、分析、政策材料和高质量论文入口。
 
 ## 当前规则

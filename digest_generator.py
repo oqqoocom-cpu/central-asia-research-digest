@@ -38,6 +38,7 @@ from urllib.parse import urljoin
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 PIPELINE_VERSION = '2.0.0'
+GITHUB_REPOSITORY_URL = 'https://github.com/oqqoocom-cpu/central-asia-research-digest'
 RUNTIME = RuntimeSettings.from_process()
 if not RUNTIME.verify_tls:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -457,6 +458,12 @@ def same_day_anchor_sort_key(item):
     if item.get('same_day_anchor'):
         return (0, int(item.get('same_day_anchor_rank', 9999) or 0))
     return (1, 9999)
+
+
+def append_project_collaboration_note(lines):
+    """Keep the open-source invitation visible without competing with readings."""
+    lines.append('项目协作：本简报项目已在 GitHub 开源，欢迎研究者使用、反馈并贡献来源适配器、筛选规则和测试：['
+                 + GITHUB_REPOSITORY_URL.rsplit('/', 1)[-1] + '](' + GITHUB_REPOSITORY_URL + ')。请勿上传文章原文、个人凭据、缓存或历史日报。')
 
 
 def selection_quality_evidence(item):
@@ -7498,6 +7505,7 @@ def render_doubao_public_digest(
     lines.append('---')
     lines.append('')
     lines.append('*本简报为深度分析版，聚焦研究价值，过滤日常新闻噪音。*')
+    append_project_collaboration_note(lines)
     return lines, published_items
 
 
@@ -8003,6 +8011,7 @@ def render_researcher_link_digest(
                      + str(cross_day_skipped) + ' 条；“0 条”仅表示本轮没有新的合格公开材料。')
     else:
         lines.append('建议用法：公开版只放深度分析与达标学术论文；内部备查只放不宜公开的深度线索；普通新闻与非白名单论文不进入任一版本；正式引用前请打开原文/DOI 核验。')
+    append_project_collaboration_note(lines)
     return lines, published_items
 
 # ================================================================
