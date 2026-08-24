@@ -39,6 +39,7 @@ _*.py
 _*.txt
 _*.json
 AGENTS.md
+!AGENTS.md
 豆包参考.txt
 信息源对照_豆包73.md
 跨电脑迁移说明.md
