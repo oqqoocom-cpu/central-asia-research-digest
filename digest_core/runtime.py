@@ -58,6 +58,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Reproduce the saved render for the selected date without network access.",
     )
+    parser.add_argument(
+        "--rescreen",
+        action="store_true",
+        help="Re-screen the saved same-day selection with current rules without network access.",
+    )
     parser.add_argument("--full", action="store_true", help="Disable stable-mode source skips.")
     parser.add_argument(
         "--no-candidates",
@@ -83,6 +88,7 @@ class RuntimeSettings:
     run_date: dt.date
     output_dir: Path | None
     replay: bool
+    rescreen: bool
     stable_mode: bool
     test_candidate_sources: bool
     translation_enabled: bool
@@ -140,6 +146,7 @@ class RuntimeSettings:
             run_date=_date(str(date_text) if date_text else None),
             output_dir=output_dir,
             replay=bool(args.replay or _bool(env.get("DIGEST_REPLAY"), False)),
+            rescreen=bool(args.rescreen or _bool(env.get("DIGEST_RESCREEN"), False)),
             stable_mode=stable_mode,
             test_candidate_sources=candidate_sources,
             translation_enabled=translation_enabled,

@@ -4,6 +4,7 @@ import json
 import sys
 import os
 import re
+import shutil
 import time
 import warnings
 from html import unescape
@@ -37,7 +38,7 @@ import urllib3
 from urllib.parse import urljoin
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
-PIPELINE_VERSION = '2.0.0'
+PIPELINE_VERSION = '2.2.0'
 GITHUB_REPOSITORY_URL = 'https://github.com/oqqoocom-cpu/central-asia-research-digest'
 RUNTIME = RuntimeSettings.from_process()
 if not RUNTIME.verify_tls:
@@ -45,19 +46,34 @@ if not RUNTIME.verify_tls:
 OUT_DIR = RUNTIME.output_dir or Path(__file__).parent
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 TODAY = RUNTIME.run_date
+ARCHIVE_DIR = OUT_DIR / 'archive'
+ROOT_DIGEST_RETENTION_DAYS = 7
 OUTPUT_FILE = OUT_DIR / f'CentralAsia_Research_{TODAY}.md'
 INTERNAL_REVIEW_FILE = OUT_DIR / f'CentralAsia_Internal_Review_{TODAY}.md'
 CACHE_FILE = OUT_DIR / '.cache.json'
 TRANSLATE_CACHE_FILE = OUT_DIR / '.translation_cache.json'
 SOURCE_HEALTH_LOG = OUT_DIR / f'source_health_{TODAY}.log'
 CANDIDATE_HEALTH_FILE = OUT_DIR / 'candidate_source_history.json'
+SOURCE_MAINTENANCE_FILE = OUT_DIR / 'source_maintenance_state.json'
+SOURCE_MAINTENANCE_LOG = OUT_DIR / f'source_maintenance_{TODAY}.log'
 SEEN_HISTORY_FILE = OUT_DIR / 'seen_item_history.json'
 DAILY_SELECTION_CACHE_FILE = OUT_DIR / f'.daily_selection_{TODAY}.json'
 DAILY_RENDER_CACHE_FILE = OUT_DIR / f'.daily_render_{TODAY}.md'
+RESCREEN_AUDIT_FILE = OUT_DIR / f'rescreen_audit_{TODAY}.json'
 GOOGLE_NEWS_RESOLVE_CACHE_FILE = OUT_DIR / '.google_news_resolve_cache.json'
 SELECTION_AUDIT_FILE = OUT_DIR / f'selection_audit_{TODAY}.json'
+SINO_WATCH_FILE = OUT_DIR / f'Sino_CentralAsia_Watch_{TODAY}.md'
+SINO_WATCH_JSON_FILE = OUT_DIR / f'sino_central_asia_watch_{TODAY}.json'
+SINO_WATCH_HISTORY_FILE = OUT_DIR / 'sino_central_asia_watch_history.json'
+SINO_WATCH_LEAD_POOL_FILE = OUT_DIR / f'Sino_CentralAsia_LeadPool_{TODAY}.md'
+SINO_WATCH_LEAD_POOL_JSON_FILE = OUT_DIR / f'sino_central_asia_lead_pool_{TODAY}.json'
+SINO_WATCH_LEAD_HISTORY_FILE = OUT_DIR / 'sino_central_asia_lead_history.json'
 MAX_TRANSLATIONS_PER_RUN = 180 if RUNTIME.translation_enabled else 0
 MAX_TRANSLATION_SECONDS_PER_RUN = 60
+SOURCE_MAINTENANCE_MAX_PROBES = 6
+SOURCE_MAINTENANCE_SKIP_INTERVAL_DAYS = 7
+SOURCE_MAINTENANCE_DISCOVERY_INTERVAL_DAYS = 30
+SOURCE_MAINTENANCE_STATE_VERSION = 2
 MAX_ITEM_AGE_DAYS = 14
 MAX_DEEP_ANALYSIS_AGE_DAYS = 30
 MAX_SLOW_PUBLICATION_AGE_DAYS = 30
@@ -98,10 +114,19 @@ ENABLE_MEETING_MINUTES_SOURCES = True
 ENABLE_ACADEMIC_SOURCES = True
 ENABLE_CHINA_PUBLISHER_SOURCES = False
 ENABLE_GDELT_DISCOVERY = RUNTIME.enable_gdelt
+ENABLE_SINO_WATCH = True
+SINO_WATCH_LOOKBACK_DAYS = 14
+SINO_WATCH_MAX_ITEMS = 8
+SINO_WATCH_PRE_ENRICH_LIMIT = 36
+SINO_WATCH_HISTORY_DAYS = 180
+SINO_WATCH_LEAD_MAX_ITEMS = 20
+SINO_WATCH_LEAD_PRE_ENRICH_LIMIT = 60
+SINO_WATCH_LEAD_HISTORY_DAYS = 90
 TRANSLATE_CALLS = 0
 TRANSLATE_CACHE = {}
 TRANSLATION_STARTED_AT = None
 SOURCE_WARNINGS = []
+SOURCE_MAINTENANCE_SUMMARY = {}
 
 RESEARCH_TOPIC_PRIORITIES = [
     {
@@ -269,6 +294,94 @@ def parse_internal_review_date_from_name(path):
     except Exception:
         return None
 
+
+GENERATED_FILE_DATE_RE = re.compile(
+    r'^(?:CentralAsia_(?:Research|Digest|Internal_Review)|'
+    r'Sino_CentralAsia_(?:Watch|LeadPool)|'
+    r'sino_central_asia_(?:watch|lead_pool)|'
+    r'\.daily_(?:render|selection)|selection_audit|rescreen_audit|source_health|source_maintenance|digest_run)_'
+    r'(\d{4}-\d{2}-\d{2})(?:\.[^.]+)?$'
+)
+
+
+def generated_file_date(path):
+    """Return the date embedded in a generated output filename, if any."""
+    match = GENERATED_FILE_DATE_RE.match(path.name)
+    if not match:
+        return None
+    try:
+        return datetime.date.fromisoformat(match.group(1))
+    except Exception:
+        return None
+
+
+def _archive_root():
+    """Resolve the archive beside the active output directory."""
+    configured = globals().get('ARCHIVE_DIR')
+    if configured is not None and configured.parent == OUT_DIR:
+        return configured
+    return OUT_DIR / 'archive'
+
+
+def find_output_file(path):
+    """Find an output in the root or in the dated archive tree."""
+    if path.exists():
+        return path
+    archive_root = _archive_root()
+    if archive_root.exists():
+        matches = sorted(
+            candidate for candidate in archive_root.rglob(path.name)
+            if candidate.is_file()
+        )
+        if matches:
+            return matches[0]
+    return path
+
+
+def iter_output_files(pattern):
+    """Iterate matching outputs in the root and archive without duplication."""
+    seen = set()
+    for path in OUT_DIR.glob(pattern):
+        if path.is_file() and path not in seen:
+            seen.add(path)
+            yield path
+    archive_root = _archive_root()
+    if archive_root.exists():
+        for path in archive_root.rglob(pattern):
+            if path.is_file() and path not in seen:
+                seen.add(path)
+                yield path
+
+
+def archive_old_outputs():
+    """Move dated outputs older than the root retention window into archive/YYYY/MM."""
+    cutoff = TODAY - datetime.timedelta(days=ROOT_DIGEST_RETENTION_DAYS)
+    archive_root = _archive_root()
+    moved = []
+    for path in list(OUT_DIR.iterdir()):
+        if not path.is_file():
+            continue
+        date_value = generated_file_date(path)
+        if not date_value or date_value > TODAY or date_value > cutoff:
+            continue
+        destination = archive_root / str(date_value.year) / f'{date_value.month:02d}' / path.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            try:
+                if destination.read_bytes() == path.read_bytes():
+                    path.unlink()
+                    moved.append(destination)
+            except OSError:
+                pass
+            continue
+        try:
+            shutil.move(str(path), str(destination))
+            moved.append(destination)
+        except OSError:
+            # Keep a readable root copy if a platform-level move fails.
+            continue
+    return moved
+
 def collect_history_keys_from_markdown(path):
     """Rebuild full history keys (incl. slug_sig/title_core_sig) from past digests."""
     keys = set()
@@ -334,7 +447,7 @@ def seed_seen_history_from_outputs(history):
     Existing keys are kept and merged to avoid losing in-run-only signals.
     """
     history = dict(history or {})
-    for path in OUT_DIR.glob('CentralAsia_*_*.md'):
+    for path in iter_output_files('CentralAsia_*_*.md'):
         date_value = parse_date_from_output_name(path)
         if not date_value or date_value == TODAY:
             continue
@@ -358,7 +471,7 @@ def load_seen_history():
 
 def collect_prior_internal_review_keys():
     keys = set()
-    for path in OUT_DIR.glob('CentralAsia_Internal_Review_*.md'):
+    for path in iter_output_files('CentralAsia_Internal_Review_*.md'):
         date_value = parse_internal_review_date_from_name(path)
         if not date_value or date_value == TODAY:
             continue
@@ -386,16 +499,28 @@ def save_seen_history(history, published_items):
     history[str(TODAY)] = sorted(today_keys)
     atomic_write_json(SEEN_HISTORY_FILE, history)
 
-def load_daily_selection_cache():
+def load_daily_selection_cache(allow_pipeline_mismatch=False):
     """Keep qualified same-day reads stable across transient source failures."""
-    if not DAILY_SELECTION_CACHE_FILE.exists():
+    cache_path = find_output_file(DAILY_SELECTION_CACHE_FILE)
+    if not cache_path.exists():
         return []
     try:
-        payload = json.loads(DAILY_SELECTION_CACHE_FILE.read_text(encoding='utf-8'))
+        payload = json.loads(cache_path.read_text(encoding='utf-8'))
     except Exception:
         return []
-    items = payload.get('items', []) if isinstance(payload, dict) else []
-    return [item for item in items if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    if payload.get('date') != str(TODAY):
+        return []
+    pipeline_mismatch = payload.get('pipeline_version') != PIPELINE_VERSION
+    if pipeline_mismatch and not allow_pipeline_mismatch:
+        return []
+    items = payload.get('items', [])
+    loaded = [dict(item) for item in items if isinstance(item, dict)]
+    if pipeline_mismatch:
+        for item in loaded:
+            item['stale_pipeline_cache'] = True
+    return loaded
 
 def save_daily_selection_cache(published_items):
     payload = {
@@ -408,14 +533,84 @@ def save_daily_selection_cache(published_items):
 
 def replay_saved_render():
     """Restore the exact saved edition for a date without touching the network."""
-    if not DAILY_RENDER_CACHE_FILE.exists():
+    render_path = find_output_file(DAILY_RENDER_CACHE_FILE)
+    if not render_path.exists():
         raise SystemExit(
             'No saved render is available for ' + str(TODAY) + ': '
-            + str(DAILY_RENDER_CACHE_FILE)
+            + str(render_path)
         )
-    rendered_markdown = DAILY_RENDER_CACHE_FILE.read_text(encoding='utf-8')
+    rendered_markdown = render_path.read_text(encoding='utf-8')
     atomic_write_text(OUTPUT_FILE, rendered_markdown)
     print('Replayed saved edition without network access: ' + str(OUTPUT_FILE))
+
+
+def rescreen_saved_selection():
+    global TRANSLATE_CACHE
+    TRANSLATE_CACHE = load_translation_cache()
+    cached_items = load_daily_selection_cache()
+    summary_mismatch_cleared = 0
+    for item in cached_items:
+        if summary_context_mismatch(item.get('title', ''), item.get('summary', '')):
+            item['summary'] = ''
+            item['summary_mismatch'] = True
+            item['summary_enriched'] = False
+            summary_mismatch_cleared += 1
+        refresh_item_evidence(item)
+    public_items = [
+        item for item in cached_items
+        if not is_publication_risky(item)
+        and not is_public_low_value(item)
+        and not is_public_simple_news(item)
+        and not is_institute_soft_content(item)
+        and is_research_grade_public_item(item)
+    ]
+    public_items, same_run_skipped, _ = drop_history_duplicate_items(public_items, set())
+    public_items = diversify_ranked_items(
+        public_items,
+        min(15, max(TARGET_PUBLIC_RECOMMENDATIONS, MIN_PUBLIC_RECOMMENDATIONS)),
+        min_unique_sources=min(MIN_PUBLIC_SOURCE_DIVERSITY, len(public_items)),
+        max_per_source=MAX_PUBLIC_ITEMS_PER_SOURCE,
+        max_academic_items=MAX_PUBLIC_ACADEMIC_ITEMS,
+    )
+    cats = {
+        'think_tank': [], 'pol_sec': [], 'econ': [], 'diplomacy': [],
+        'news': [], 'ru': [], 'local': [], 'cn': [],
+    }
+    for item in public_items:
+        cats[categorize_item(item)].append(item)
+    audit_payload = {}
+    try:
+        audit_path = find_output_file(SELECTION_AUDIT_FILE)
+        audit_payload = json.loads(audit_path.read_text(encoding='utf-8'))
+    except Exception:
+        audit_payload = {}
+    funnel = audit_payload.get('funnel', {}) if isinstance(audit_payload, dict) else {}
+    cross_day_skipped = int(funnel.get('cross_day_skipped', 0) or 0)
+    deep_focus = [item for item in public_items if is_deep_item(item)]
+    policy_focus = [item for item in public_items if is_policy_data_item(item)]
+    lines, published_items = render_researcher_link_digest(
+        public_items, deep_focus, policy_focus, cats,
+        {}, {}, [], [], [], cross_day_skipped, [], [], [],
+        rescreen_source_count=len(cached_items),
+        sino_watch_stats=load_sino_watch_stats(),
+    )
+    rendered_markdown = '\n'.join(lines)
+    atomic_write_text(OUTPUT_FILE, rendered_markdown)
+    atomic_write_text(DAILY_RENDER_CACHE_FILE, rendered_markdown)
+    atomic_write_json(RESCREEN_AUDIT_FILE, {
+        'pipeline_version': PIPELINE_VERSION,
+        'date': str(TODAY),
+        'mode': 'offline_rescreen',
+        'source_selection_cache_items': len(cached_items),
+        'retained_public_items': len(published_items),
+        'cross_day_skipped': cross_day_skipped,
+        'same_run_skipped': same_run_skipped,
+        'summary_mismatch_cleared': summary_mismatch_cleared,
+        'note': '本文件仅记录离线重筛结果，不覆盖正常联网运行的选择审计、历史去重和当日候选缓存。',
+    })
+    save_translation_cache()
+    print('Rescreened saved same-day selection without network access: ' + str(OUTPUT_FILE))
+    print('Retained public items: ' + str(len(published_items)))
 
 
 def same_day_anchor_identity_keys(item):
@@ -749,6 +944,18 @@ def link_slug_signature_key(link):
         return ''
     return 'slug_sig:' + ' '.join(parts[:12])
 
+
+def document_family_key(link):
+    """Return a verified publisher-specific identity for language editions."""
+    normalized = normalize_history_link(link).lower()
+    if not normalized:
+        return ''
+    for marker, family in CROSS_LANGUAGE_DOCUMENT_FAMILIES.items():
+        if marker in normalized:
+            return 'family:' + family
+    return ''
+
+
 def title_history_keys(title):
     keys = set()
     cleaned = clean_history_title(title)
@@ -768,6 +975,9 @@ def title_history_keys(title):
 
 def item_history_keys(item):
     keys = set()
+    family_key = document_family_key(item.get('link', ''))
+    if family_key:
+        keys.add(family_key)
     edition_id = clean_text(item.get('edition_id', ''))
     versioned_stable_url = item.get('versioned_stable_url') is True
     if edition_id and versioned_stable_url:
@@ -948,6 +1158,16 @@ def item_age_days(item):
 def infer_date_from_context(*parts):
     return parse_date_text(' '.join(clean_text(part) for part in parts if part))
 
+
+def publication_year_from_url(url):
+    """Read an explicit archive year from a URL path without inventing a day."""
+    path = urllib.parse.urlsplit(clean_text(url)).path
+    matches = re.findall(r'/(20\d{2})(?:/|$)', path)
+    if not matches:
+        return None
+    year = int(matches[-1])
+    return year if 2000 <= year <= TODAY.year + 1 else None
+
 def detect_lang(text):
     if re.search(r'[\u4e00-\u9fff]', text or ''):
         return 'zh'
@@ -955,6 +1175,8 @@ def detect_lang(text):
         return 'uz'
     if re.search(r'[ЎўҲҳ]', text or ''):
         return 'uz'
+    if re.search(r'\b(türk\w*|dünyas\w*|şahdamar\w*|asya\w*|kafkasya\w*|özbek\w*|diplomas\w*|cumhurbaşkan\w*|başkan\w*|güvenlik\w*|konsey\w*|değerlendir\w*|dönüşüm\w*|pozisyon\w*|ortaya\w*|çıkış\w*|ziyaret\w*|anlaşma\w*|zafer\w*|genişlet\w*)\b', text or '', re.IGNORECASE):
+        return 'tr'
     if re.search(r'[ӘәҒғҚқҢңӨөҰұҮүҺһІі]', text or ''):
         return 'kk'
     if re.search(r'[\u0400-\u04ff]', text or ''):
@@ -962,6 +1184,14 @@ def detect_lang(text):
     return 'en'
 
 MANUAL_TRANSLATION_RULES = [
+    (
+        ['ankasam başkanı', 'güvenlik konseyi', 'değerlendirdi'],
+        'ANKASAM主席Mehmet Seyfettin Erol教授在《Inbusiness.kz》评估了哈萨克斯坦安全委员会的转型及新关键职位的出现',
+    ),
+    (
+        ['türk dünyasının yeni şahdamarı', 'genişletilmiş hazar havzası', 'özbek diplomasisinin'],
+        '突厥世界的新生命线：从中亚延伸至高加索的扩展里海盆地与乌兹别克斯坦外交35周年的胜利',
+    ),
     (
         ['контрольный выстрел', 'швейн', 'кыргызстан'],
         '补枪：俄罗斯如何压垮吉尔吉斯斯坦服装业',
@@ -983,6 +1213,37 @@ MANUAL_TRANSLATION_RULES = [
     ),
 ]
 
+MANUAL_SUMMARY_TRANSLATION_RULES = [
+    (
+        ['central asia', 'urban map is changing fast', 'trade diversification'],
+        '中亚的城市地图正在迅速变化。贸易多元化、年轻人口和快速数字化正在把主要城市转变为重要市场。塔什干、比什凯克和杜尚别正在现代化，奇姆肯特和撒马尔罕也在扩大其经济与文化作用。',
+    ),
+    (
+        ['key takeaways', 'secondary sanctions threaten central asia', 'iran as a southern'],
+        '报告指出，特朗普8月19日宣布的“经济D日”和美国财政部长贝森特8月24日宣布的“经济弃儿行动”带来的次级制裁，可能威胁中亚国家把伊朗作为南向通道的使用空间，并波及伊朗境内的公路、铁路、港口、保险和银行服务。',
+    ),
+    (
+        ['настоящей работе', 'ранними браками', 'кыргызстане'],
+        '本文对吉尔吉斯斯坦早婚状况进行了最新分析，讨论其成因、社会后果及相关政策应对。',
+    ),
+    (
+        ['shrinking caspian', 'western kazakhstan', 'official media'],
+        '文章把阿克套、阿特劳附近哈萨克斯坦浅水大陆架的里海萎缩与咸海灾难相比较，并指出官方媒体持续强调跨里海运输走廊，但港口仍需反复疏浚。西哈萨克斯坦作为石油出口和财政贡献地区，同时面临贫困、健康压力与国家关注不足等结构性问题。',
+    ),
+    (
+        ['trans-caspian fiber-optic cable', "russia's grip on central asia's internet", 'commercial service'],
+        '跨里海光纤电缆已完成阿塞拜疆与哈萨克斯坦之间难度最高的海底段，下一阶段将推进沿岸接入和陆上网络衔接，计划于2026年底投入商业运营。该项目将增强中亚网络连接的多元化，并减少区域互联网基础设施对俄罗斯通道的依赖。',
+    ),
+    (
+        ['an assessment of president sadyr japarov', 'head of the security services', 'economic dependence on china'],
+        '访谈评估萨德尔·扎帕罗夫执政时期的政治变化，重点讨论安全部门负责人被免职后的权力调整、2027年选举前景以及吉尔吉斯斯坦对华经济依赖上升等问题。',
+    ),
+    (
+        ['2023 жылғы қаңтарда', 'kazakhstan futures', '2050'],
+        '2023年1月，Oxus Society在美国驻哈萨克斯坦大使馆公共事务部门资助下启动为期一年的“哈萨克斯坦未来”项目，通过系列研讨分析到2050年该国可能面临的社会经济问题、发展机遇与未来情景。',
+    ),
+]
+
 COUNTRY_TRANSLATION_EXPECTATIONS = [
     (['ўзбекистон', 'узбекистан', 'o‘zbekiston', 'oʻzbekiston', "o'zbekiston", 'uzbekistan'], '乌兹别克'),
     (['қазақстан', 'казахстан', 'kazakhstan'], '哈萨克'),
@@ -1000,6 +1261,14 @@ def manual_translation_override(text):
             return translation
     return ''
 
+
+def manual_summary_translation_override(text):
+    lowered = clean_text(text).lower()
+    for required_terms, translation in MANUAL_SUMMARY_TRANSLATION_RULES:
+        if all(term in lowered for term in required_terms):
+            return translation
+    return ''
+
 def violates_country_translation_sanity(translated, original):
     translated = translated or ''
     original_lowered = (original or '').lower()
@@ -1010,6 +1279,20 @@ def violates_country_translation_sanity(translated, original):
         if any(term in original_lowered for term in original_terms) and expected_chinese not in translated:
             return True
     return False
+
+def looks_like_source_mixture(translated, original):
+    if not translated or not original or not re.search(r'[\u4e00-\u9fff]', translated):
+        return False
+    original_tokens = {
+        token.lower()
+        for token in re.findall(r'[^\W_]+', original, flags=re.UNICODE)
+        if len(token) >= 3 and not token.isdigit()
+    }
+    if len(original_tokens) < 5:
+        return False
+    translated_lowered = translated.lower()
+    preserved_tokens = sum(1 for token in original_tokens if token in translated_lowered)
+    return preserved_tokens >= 4 and preserved_tokens / len(original_tokens) >= 0.5
 
 def looks_translated(text, original):
     if not text:
@@ -1023,6 +1306,8 @@ def looks_translated(text, original):
     ]
     original_lowered = (original or '').lower()
     if any(term in lowered for term in bad_translation_terms) and not any(term in original_lowered for term in bad_translation_terms):
+        return False
+    if looks_like_source_mixture(text, original):
         return False
     if violates_country_translation_sanity(text, original):
         return False
@@ -1108,7 +1393,7 @@ def translate_text(text, target_lang='zh-cn'):
     if translation_budget_exhausted():
         return text
     try:
-        source = source_lang if source_lang in {'ru', 'kk', 'uz'} else 'en'
+        source = source_lang if source_lang in {'ru', 'kk', 'uz', 'tr'} else 'en'
         url = 'https://lingva.ml/api/v1/' + source + '/zh/' + urllib.parse.quote(text)
         req = urllib.request.Request(url, data=None, headers={'User-Agent': 'Mozilla/5.0'})
         time.sleep(0.1)
@@ -1160,14 +1445,16 @@ FEEDS = {
     'Kloop': ['https://kloop.kg/feed/'],
     # 塔吉克斯坦
     'Khovar TJ': ['https://khovar.tj/rss'],
-    'Asia-Plus TJ': ['https://en.asia-plus.tj/rss'],
+    'Asia-Plus TJ': ['https://asiaplus.news/tg/feed/'],
     'Somon.tj': ['https://somon.tj/rss'],
     'Ziyo.net': ['https://ziyo.net/rss'],
     'Nahod.tj': ['https://nahod.tj/rss'],
     'Vazhnoe.tj': ['https://vazhnoe.tj/rss'],
     'Avesta TJ': ['https://avesta.tj/feed/'],
     # 土库曼斯坦
-    'TDH TM': ['https://tdh.tm/rss'],
+    # TDH migrated from tdh.tm to the official tdh.gov.tm domain; the old
+    # endpoint consistently failed TLS negotiation, while the new RSS is live.
+    'TDH TM': ['https://www.tdh.gov.tm/en/rss.xml'],
     'Tribune.TM': ['https://tribune.tm/rss'],
     'News-tm': ['https://news-tm.com/rss'],
     'Business Turkmenistan': ['https://business.com.tm/rss'],
@@ -1213,7 +1500,8 @@ FEEDS.update({
     # P1 2026-07-18: Doubao-aligned deep/business discovery feeds
     'bne IntelliNews Central Asia': ['https://www.intellinews.com/rss/'],
     'Fergana News English': ['https://en.fergana.news/rss.php', 'https://fergana.agency/rss.php'],
-    'Kapital.kz English': ['https://kapital.kz/rss'],
+    # Kapital.kz retired /rss; /feed is the current site-wide RSS endpoint.
+    'Kapital.kz English': ['https://kapital.kz/feed'],
     'Eurasian Research Institute': ['https://www.eurasian-research.org/feed/'],
     'Global Voices Central Asia': ['https://globalvoices.org/-/world/central-asia/feed/'],
     'Caspian Policy Center RSS': ['https://www.caspianpolicy.org/rss.xml'],
@@ -1346,9 +1634,9 @@ WEB_SOURCES = {
     'AKIpress': 'https://akipress.com',
     'Kloop': 'https://kloop.kg',
     'Khovar TJ': 'https://khovar.tj',
-    'Asia-Plus TJ': 'https://en.asia-plus.tj',
+    'Asia-Plus TJ': 'https://asiaplus.news/tg/homepage-tj/',
     'Avesta TJ': 'https://avesta.tj',
-    'TDH TM': 'https://tdh.tm',
+    'TDH TM': 'https://www.tdh.gov.tm/en',
     'Turkmenportal': 'https://turkmenportal.com/en',
     'Orient TM': 'https://orient.tm/en',
     'Business Turkmenistan': 'https://business.com.tm',
@@ -1371,6 +1659,10 @@ WEB_SOURCES = {
     'Human Rights Watch Central Asia': 'https://www.hrw.org/europe/central-asia',
     'UNDP Eurasia': 'https://www.undp.org/eurasia/news-centre',
     'OSW Central Asia': 'https://www.osw.waw.pl/en/publikacje?f%5B0%5D=obszary%3A399',
+    # Official publication surfaces restored during the 2026-10-07 entrance
+    # maintenance pass; their legacy RSS/search endpoints are not usable.
+    'Central Asia Program (Wilson Center)': 'https://www.wilsoncenter.org/region/central-asia',
+    'Eurasian Research Institute': 'https://eurasian-research.org/publications?category=ebulletin',
 }
 
 CANDIDATE_WEB_SOURCES = {
@@ -1405,7 +1697,7 @@ CANDIDATE_WEB_SOURCES = {
     'MERICS Central Asia Search': 'https://merics.org/en/search?search=Central%20Asia',
     'IDOS Central Asia Search': 'https://www.idos-research.de/en/search?search=Central%20Asia',
     'Carnegie Search Central Asia': 'https://carnegieendowment.org/regions/russia-eurasia/central-asia',
-    'Brookings Search Central Asia': 'https://www.brookings.edu/search/?s=Central%20Asia',
+    'Brookings Search Central Asia': 'https://www.brookings.edu/topic/central-asia/',
     'CSIS Search Central Asia': 'https://www.csis.org/regions/russia-and-eurasia/central-asia',
     'Atlantic Council Search Central Asia': 'https://www.atlanticcouncil.org/?s=Central+Asia',
     'Stimson Search Central Asia': 'https://www.stimson.org/?s=Central+Asia',
@@ -1431,7 +1723,7 @@ CANDIDATE_WEB_SOURCES = {
     'IISS Strategic Comments Central Asia': 'https://www.iiss.org/search/?query=Central%20Asia%20strategic%20comments',
     'MERICS China Central Asia': 'https://merics.org/en/topics/china-central-asia',
     'Kennan Cable Central Asia': 'https://www.wilsoncenter.org/publication-series/kennan-cable',
-    'ISRS Publications': 'https://isrs.uz/en/analytical-materials',
+    'ISRS Publications': 'https://isrs.uz/en/',
     'IWPR Investigations Central Asia': 'https://iwpr.net/global-voices/central-asia',
     'The Third Pole Central Asia': 'https://www.thethirdpole.net/en/?s=Central+Asia',
 }
@@ -1466,6 +1758,11 @@ NEIGHBORING_COUNTRY_PERSPECTIVE_SOURCES = {
     # India
     'ORF Search Central Asia', 'Observer Research Foundation Central Asia',
     'Manohar Parrikar IDSA Central Asia',
+}
+
+# Publisher-verified language/edition families. Keep this deliberately narrow.
+CROSS_LANGUAGE_DOCUMENT_FAMILIES = {
+    'oxussociety.org/publications/zhanatas': 'oxus:zhanatas-wind-farm-report',
 }
 
 # Search/archive pages from major research institutions are publication
@@ -1537,7 +1834,7 @@ PDF_REPORT_SOURCES = {
     'University of Central Asia Publications': 'https://ucentralasia.org/publications',
     'FES Central Asia Publications': 'https://centralasia.fes.de/publications',
     'CAPS Unlock Publications': 'https://capsunlock.org/publications/',
-    'ISRS Analytical Materials': 'https://isrs.uz/en/analytical-materials',
+    'ISRS Analytical Materials': 'https://isrs.uz/en',
     'IISS Publications Central Asia': 'https://www.iiss.org/publications/?query=Central%20Asia',
     'MERICS Reports Central Asia': 'https://merics.org/en/search?search=Central%20Asia',
     'Silk Road Studies Publications': 'https://www.silkroadstudies.org/publications.html',
@@ -1560,10 +1857,10 @@ PDF_REPORT_SOURCES = {
     'FPRI Eurasia Publications': 'https://www.fpri.org/region/eurasia/',
     # Additional regional, national and university research publishers.
     'KazISS Analytical Publications': 'https://kisi.kz/en/analytics/',
-    'IWEP Kazakhstan Publications': 'https://iwep.kz/en/publications',
+    'IWEP Kazakhstan Publications': 'https://iwep.kz/',
     'Oxus Society Publications': 'https://oxussociety.org/publications/',
     'Central Asia-Caucasus Institute Publications': 'https://www.silkroadstudies.org/publications.html',
-    'Central Asia Forum Publications': 'https://www.centralasiaforum.org/publications',
+    'Central Asia Forum Publications': 'https://centralasiaforum.org/articles/',
     'KAS Central Asia Publications': 'https://www.kas.de/en/web/zentralasien',
     'Afghanistan Analysts Network': 'https://www.afghanistan-analysts.org/en/',
     'Human Rights Watch Central Asia': 'https://www.hrw.org/asia/central-asia',
@@ -1571,15 +1868,43 @@ PDF_REPORT_SOURCES = {
     'GMF Central Asia Publications': 'https://www.gmfus.org/search?search_api_fulltext=Central%20Asia',
     'NHC Central Asia Reports': 'https://www.nhc.no/en/central-asia/',
     'UNESCAP Central Asia Publications': 'https://www.unescap.org/publications',
-    'FAO Europe Central Asia Publications': 'https://www.fao.org/europe/publications/en/',
-    'UNICEF Europe Central Asia Reports': 'https://www.unicef.org/eca/reports',
+    'FAO Europe Central Asia Publications': 'https://www.fao.org/europe/en/',
+    'UNICEF Europe Central Asia Reports': 'https://www.unicef.org/eca/research-and-reports',
     'ICG Central Asia Publications': 'https://www.crisisgroup.org/regions/asia/central-asia',
+}
+
+# Entrance audit 2026-09-03: these first-party pages are valuable discovery
+# targets, but their archive pages currently return bot challenges, redirects,
+# or unstable legacy paths to this runtime. Keep them in the source registry
+# and discover their dated documents through targeted queries instead of
+# producing a daily hard-fetch warning for a page that cannot be read.
+REPORT_DISCOVERY_ONLY_SOURCES = {
+    'EDB Reports',
+    'OECD Eurasia Publications',
+    'UNDP Europe and Central Asia Publications',
+    'IOM Central Asia Publications',
+    'UNESCAP Central Asia Publications',
+    'UNICEF Europe Central Asia Reports',
+    'Chatham House Russia-Eurasia Publications',
+    'KAS Central Asia Publications',
+    'Human Rights Watch Central Asia',
+    'ICG Central Asia Publications',
+    'ISRS Analytical Materials',
+    'IWEP Kazakhstan Publications',
+}
+
+REPORT_SOURCE_ACCESS_MODE = {
+    source: ('discovery-only' if source in REPORT_DISCOVERY_ONLY_SOURCES else 'direct-archive')
+    for source in PDF_REPORT_SOURCES
 }
 
 # Explicit registry for institution-originated research publications. This
 # metadata keeps formal reports separate from generic media discovery and lets
 # the renderer explain why a source was included.
 INSTITUTION_SOURCE_REGISTRY = {
+    'ADB Publications': {'institution': 'Asian Development Bank', 'kind': 'research_report', 'tier': 1},
+    'FAO Europe Central Asia Publications': {'institution': 'FAO Regional Office for Europe and Central Asia', 'kind': 'research_report', 'tier': 1},
+    'Central Asia Forum Publications': {'institution': 'Central Asia Forum', 'kind': 'research_publication', 'tier': 1},
     'Central Asia Program Policy Briefs': {'institution': 'Central Asia Program', 'kind': 'policy_brief', 'tier': 1},
     'OSCE Academy Policy Briefs': {'institution': 'OSCE Academy', 'kind': 'policy_brief', 'tier': 1},
     'University of Central Asia Publications': {'institution': 'University of Central Asia', 'kind': 'research_publication', 'tier': 1},
@@ -1625,6 +1950,16 @@ INSTITUTION_SOURCE_REGISTRY = {
 }
 
 INSTITUTION_ADAPTER_CONFIG = {
+    'ADB Publications': {
+        'selectors': ['a[href*="/publications/"]'],
+        'allowed_paths': ['/publications/'],
+        'exclude_terms': ['facebook', 'twitter', 'linkedin', 'corrigenda', 'ordering'],
+        'alternate_urls': [
+            'https://www.adb.org/publications/latest',
+            'https://www.adb.org/publications/papers',
+            'https://www.adb.org/publications/reports',
+        ],
+    },
     'Central Asia Program Policy Briefs': {
         'selectors': ['article a[href]', 'a[href*="/publications/"]', 'a[href*="/policy-"]'],
         'allowed_paths': ['/publications/', '/policy-'],
@@ -1642,6 +1977,7 @@ INSTITUTION_ADAPTER_CONFIG = {
         'exclude_terms': ['event', 'webinar', 'podcast'],
         'alternate_urls': ['https://www.brookings.edu/search/?q=Central%20Asia'],
         'sitemap_urls': ['https://www.brookings.edu/sitemap_index.xml'],
+        'sitemap_max_documents': 20,
     },
     'CSIS Russia and Eurasia Publications': {
         'selectors': ['a[href*="/analysis/"]', 'a[href*="/reports/"]'],
@@ -1649,6 +1985,7 @@ INSTITUTION_ADAPTER_CONFIG = {
         'exclude_terms': ['event', 'webinar', 'podcast'],
         'alternate_urls': ['https://www.csis.org/regions/russia-and-eurasia'],
         'sitemap_urls': ['https://www.csis.org/sitemap.xml'],
+        'sitemap_max_documents': 28,
     },
     'PONARS Eurasia Policy Memos': {
         'selectors': ['a[href*="/memos/"]', 'a[href*="policy-memos"]', 'a[href*="/perspectives/"]'],
@@ -1683,7 +2020,8 @@ INSTITUTION_ADAPTER_CONFIG = {
         'allowed_paths': ['/research/', '/commentary/', '/analysis/'],
         'exclude_terms': ['event', 'webinar', 'podcast', 'membership'],
         'alternate_urls': ['https://www.rusi.org/explore-our-research/publications'],
-        'sitemap_urls': ['https://www.rusi.org/sitemap.xml'],
+        'sitemap_urls': ['https://www.rusi.org/sitemap-index.xml'],
+        'sitemap_max_documents': 3,
     },
     'PISM Central Asia Publications': {
         'selectors': ['article a[href]', 'a[href*="/publications/"]'],
@@ -1700,6 +2038,8 @@ INSTITUTION_ADAPTER_CONFIG = {
         'selectors': ['article a[href]', 'a[href*="/publications/"]'],
         'allowed_paths': ['/publications/'],
         'exclude_terms': ['event', 'webinar', 'podcast', 'yearbook'],
+        'sitemap_urls': ['https://www.sipri.org/sitemap.xml'],
+        'sitemap_max_documents': 20,
     },
     'OSCE Academy Policy Briefs': {
         'selectors': ['article a[href]', 'a[href*="/publication"]'],
@@ -1727,9 +2067,10 @@ INSTITUTION_ADAPTER_CONFIG = {
         'exclude_terms': ['event', 'webinar', 'podcast', 'newsletter'],
     },
     'ISRS Analytical Materials': {
-        'selectors': ['article a[href]', 'a[href*="/analytical-materials/"]'],
-        'allowed_paths': ['/analytical-materials/'],
+        'selectors': ['article a[href]', 'a[href*="/oz/"]', 'a[href*="/en/"]'],
+        'allowed_paths': ['/oz/', '/en/'],
         'exclude_terms': ['event', 'webinar', 'podcast', 'news'],
+        'alternate_urls': ['https://isrs.uz/oz', 'https://isrs.uz/en'],
     },
     'MERICS Reports Central Asia': {
         'selectors': ['article a[href]', 'a[href*="/en/report/"]', 'a[href*="/en/analysis/"]'],
@@ -1746,6 +2087,8 @@ INSTITUTION_ADAPTER_CONFIG = {
         'selectors': ['article a[href]', 'a[href*="/papers/"]'],
         'allowed_paths': ['/papers/'],
         'exclude_terms': ['event', 'webinar', 'podcast', 'newsletter'],
+        'sitemap_urls': ['https://www.ifri.org/sitemap.xml'],
+        'sitemap_max_documents': 13,
     },
     'IAI Publications': {
         'selectors': ['article a[href]', 'a[href*="/pubblicazioni/"]'],
@@ -1758,9 +2101,10 @@ INSTITUTION_ADAPTER_CONFIG = {
         'exclude_terms': ['event', 'webinar', 'podcast', 'news'],
     },
     'IWEP Kazakhstan Publications': {
-        'selectors': ['article a[href]', 'a[href*="/publications"]'],
-        'allowed_paths': ['/publications'],
+        'selectors': ['article a[href]', 'a[href*="/en/"]', 'a[href*="/ru/"]'],
+        'allowed_paths': ['/en/', '/ru/'],
         'exclude_terms': ['event', 'webinar', 'podcast', 'news'],
+        'alternate_urls': ['https://iwep.kz/'],
     },
     'Oxus Society Publications': {
         'selectors': ['article a[href]', 'a[href*="/publications"]'],
@@ -1773,9 +2117,10 @@ INSTITUTION_ADAPTER_CONFIG = {
         'exclude_terms': ['event', 'webinar', 'podcast', 'tag', 'itemlist', 'center', 'centre', 'about'],
     },
     'Central Asia Forum Publications': {
-        'selectors': ['article a[href]', 'a[href*="/publications"]'],
-        'allowed_paths': ['/publications'],
-        'exclude_terms': ['event', 'webinar', 'podcast', 'course'],
+        'selectors': ['article a[href]', 'a[href*="/articles/"]', 'a[href*="/issues/"]', 'a[href*="/publications"]'],
+        'allowed_paths': ['/articles/', '/issues/', '/publications'],
+        'exclude_terms': ['conference', 'speaker', 'event', 'webinar', 'podcast', 'course'],
+        'alternate_urls': ['https://centralasiaforum.org/articles/', 'https://centralasiaforum.org/issues/'],
     },
     'KAS Central Asia Publications': {
         'selectors': ['article a[href]', 'a[href*="/publikationen"]', 'a[href*="/publication"]'],
@@ -1796,6 +2141,8 @@ INSTITUTION_ADAPTER_CONFIG = {
         'selectors': ['article a[href]', 'a[href*="/publication/"]'],
         'allowed_paths': ['/publication/', '/article/'],
         'exclude_terms': ['event', 'webinar', 'podcast', 'newsletter'],
+        'sitemap_urls': ['https://ecfr.eu/sitemap.xml'],
+        'sitemap_max_documents': 4,
     },
     'GMF Central Asia Publications': {
         'selectors': ['article a[href]', 'a[href*="/publications/"]', 'a[href*="/analysis/"]'],
@@ -1813,14 +2160,16 @@ INSTITUTION_ADAPTER_CONFIG = {
         'exclude_terms': ['event', 'webinar', 'podcast', 'vacancy'],
     },
     'FAO Europe Central Asia Publications': {
-        'selectors': ['article a[href]', 'a[href*="/publications/"]'],
-        'allowed_paths': ['/publications/'],
-        'exclude_terms': ['event', 'webinar', 'podcast', 'vacancy'],
+        'selectors': ['article a[href]', 'a[href*="/publications/"]', 'a[href*="/resources/"]'],
+        'allowed_paths': ['/publications/', '/resources/'],
+        'exclude_terms': ['event', 'webinar', 'podcast', 'vacancy', 'procurement', 'audit', 'misconduct'],
+        'alternate_urls': ['https://www.fao.org/europe/en/', 'https://www.fao.org/publications/en/'],
     },
     'UNICEF Europe Central Asia Reports': {
-        'selectors': ['article a[href]', 'a[href*="/reports/"]', 'a[href*="/resources/"]'],
-        'allowed_paths': ['/reports/', '/resources/'],
+        'selectors': ['article a[href]', 'a[href*="/reports/"]', 'a[href*="/resources/"]', 'a[href*="/research-and-reports"]'],
+        'allowed_paths': ['/reports/', '/resources/', '/research-and-reports'],
         'exclude_terms': ['event', 'webinar', 'podcast', 'vacancy'],
+        'alternate_urls': ['https://www.unicef.org/eca/research-and-reports'],
     },
     'ICG Central Asia Publications': {
         'selectors': ['article a[href]', 'a[href*="/content/"]', 'a[href*="/crisiswatch/"]'],
@@ -2173,6 +2522,21 @@ DEEP_DISCOVERY_QUERIES = [
     'Wilson Center Kennan Central Asia paper',
     'Davis Center Harvard Central Asia publication',
     'FPRI Eurasia Central Asia policy brief',
+    # Country- and issue-led discovery: major institutions often omit the
+    # phrase "Central Asia" from titles and instead foreground one state,
+    # Eurasia, the Caspian, security, energy, or transport corridors.
+    'site:csis.org/analysis Kazakhstan Uzbekistan Kyrgyzstan Tajikistan Turkmenistan Eurasia Caspian',
+    'site:carnegieendowment.org/research Kazakhstan Uzbekistan Kyrgyzstan Tajikistan Turkmenistan Eurasia',
+    'site:chathamhouse.org Kazakhstan Uzbekistan Kyrgyzstan Tajikistan Turkmenistan Caspian analysis',
+    'site:rusi.org/explore-our-research Kazakhstan Uzbekistan Kyrgyzstan Tajikistan Turkmenistan Eurasia',
+    'site:ecfr.eu/publication Kazakhstan Uzbekistan Kyrgyzstan Tajikistan Turkmenistan Caspian',
+    'site:ifri.org/en/papers Kazakhstan Uzbekistan Kyrgyzstan Tajikistan Turkmenistan Caspian',
+    'Kazakhstan governance political economy institutional reform think tank report',
+    'Uzbekistan reform state capacity political economy think tank report',
+    'Kyrgyzstan Tajikistan China security border governance research report',
+    'Turkmenistan gas political economy governance research report',
+    'Caspian energy security critical minerals policy report',
+    'Eurasia railway corridor Kazakhstan Uzbekistan strategic analysis',
 ]
 
 NEIGHBOR_DEEP_DISCOVERY_GROUPS = [
@@ -2247,6 +2611,199 @@ for group in NEIGHBOR_DEEP_DISCOVERY_GROUPS:
         for query in group['queries']
     ]
 DEEP_DISCOVERY_TOTAL_TASKS = sum(len(urls) for urls in DEEP_DISCOVERY_SOURCES.values())
+
+SINO_WATCH_QUERY_GROUPS = [
+    {
+        'source': 'Sino Watch: Google News EN',
+        'hl': 'en', 'gl': 'US', 'ceid': 'US:en',
+        'queries': [
+            'China Central Asia (protest OR pollution OR land OR labor OR debt OR corruption OR surveillance)',
+            'Chinese company Kazakhstan (protest OR pollution OR workers OR jobs OR land OR dispute)',
+            'Chinese investment Uzbekistan (controversy OR labor OR environment OR debt OR corruption)',
+            'Chinese project Kyrgyzstan Tajikistan (protest OR pollution OR workers OR contract OR dispute)',
+            'Xinjiang Central Asia families trade border rights investigation',
+            'China Central Asia environmental conflict community opposition analysis',
+            'China Central Asia debt contract transparency local backlash report',
+            'China Central Asia surveillance digital governance rights report',
+        ],
+    },
+    {
+        'source': 'Sino Watch: Google News RU',
+        'hl': 'ru', 'gl': 'RU', 'ceid': 'RU:ru',
+        'queries': [
+            'Китай Центральная Азия (протест OR загрязнение OR земля OR рабочие OR долг OR коррупция)',
+            'китайская компания Казахстан (протест OR экология OR рабочие OR занятость OR конфликт)',
+            'китайские инвестиции Узбекистан (скандал OR коррупция OR труд OR экология OR долг)',
+            'Китай Кыргызстан Таджикистан (протест OR загрязнение OR контракт OR недовольство)',
+            'Синьцзян Центральная Азия семьи граница права расследование',
+            'Китай Центральная Азия слежка цифровое управление права',
+        ],
+    },
+    {
+        'source': 'Sino Watch: Google News TR/CA',
+        'hl': 'tr', 'gl': 'TR', 'ceid': 'TR:tr',
+        'queries': [
+            'Çin Orta Asya (protesto OR çevre kirliliği OR işçi OR borç OR yolsuzluk)',
+            'Çin şirketi Kazakistan (protesto OR işçiler OR çevre OR anlaşmazlık)',
+            'Çin yatırımı Özbekistan (tartışma OR emek OR çevre OR borç)',
+            'Қытай Қазақстан (наразылық OR экология OR жұмыс OR жер)',
+            'Китай Казахстан (протест OR загрязнение OR рабочие OR коррупция)',
+        ],
+    },
+]
+SINO_WATCH_LOCAL_QUERY_GROUPS = [
+    {
+        'source': 'Sino Watch Local Search: Kazakhstan (kk)',
+        'hl': 'kk', 'gl': 'KZ', 'ceid': 'KZ:kk',
+        'queries': [
+            'Қытай Қазақстан наразылық',
+            'Қытай Қазақстан экология дау',
+            'Қытай инвестициясы Қазақстан сын',
+            'Қытай жұмысшылары Қазақстан еңбек дауы',
+            'Шыңжаң Қазақстан қазақтар құқық',
+        ],
+    },
+    {
+        'source': 'Sino Watch Local Search: Uzbekistan (uz)',
+        'hl': 'uz', 'gl': 'UZ', 'ceid': 'UZ:uz',
+        'queries': [
+            'Xitoy Oʻzbekiston norozilik',
+            'Xitoy kompaniyasi Oʻzbekiston ekologiya',
+            'Xitoy investitsiyasi Oʻzbekiston korrupsiya',
+            'Xitoy ishchilari Oʻzbekiston mehnat nizosi',
+            'Shinjon Oʻzbekiston huquqlar',
+        ],
+    },
+    {
+        'source': 'Sino Watch Local Search: Kyrgyzstan (ky)',
+        'hl': 'ky', 'gl': 'KG', 'ceid': 'KG:ky',
+        'queries': [
+            'Кытай Кыргызстан нааразычылык',
+            'Кытай компаниясы Кыргызстан экология',
+            'Кытай долбоору Кыргызстан карыз',
+            'Кытай жумушчулары Кыргызстан талаш',
+            'Шинжаң Кыргызстан укук',
+        ],
+    },
+    {
+        'source': 'Sino Watch Local Search: Tajikistan (tg)',
+        'hl': 'tg', 'gl': 'TJ', 'ceid': 'TJ:tg',
+        'queries': [
+            'Чин Тоҷикистон эътироз',
+            'ширкати чинӣ Тоҷикистон баҳс',
+            'сармоягузории Чин Тоҷикистон танқид',
+            'коргарони чинӣ Тоҷикистон ихтилоф',
+            'Синзян Тоҷикистон ҳуқуқ',
+        ],
+    },
+    {
+        'source': 'Sino Watch Local Search: Turkmenistan (tk)',
+        'hl': 'tk', 'gl': 'TM', 'ceid': 'TM:tk',
+        'queries': [
+            'Hytaý Türkmenistan nägilelik',
+            'Hytaý taslamasy Türkmenistan jedel',
+            'Hytaý karzy Türkmenistan tankyt',
+            'Hytaý işçileri Türkmenistan zähmet dawasy',
+            'Şyngjan Türkmenistan hukuk',
+        ],
+    },
+]
+SINO_WATCH_QUERY_GROUPS.extend(SINO_WATCH_LOCAL_QUERY_GROUPS)
+SINO_WATCH_DISCOVERY_SOURCES = {}
+for group in SINO_WATCH_QUERY_GROUPS:
+    SINO_WATCH_DISCOVERY_SOURCES[group['source']] = [
+        'https://news.google.com/rss/search?q='
+        + urllib.parse.quote(query + ' when:' + str(SINO_WATCH_LOOKBACK_DAYS) + 'd')
+        + '&hl=' + group['hl'] + '&gl=' + group['gl'] + '&ceid=' + group['ceid']
+        for query in group['queries']
+    ]
+SINO_WATCH_TOTAL_TASKS = sum(len(urls) for urls in SINO_WATCH_DISCOVERY_SOURCES.values())
+
+SINO_WATCH_LOCAL_FEEDS = {
+    'Sino Watch Local: Kazakhstan (kk)｜Azattyq': 'https://www.azattyq.org/api/',
+    'Sino Watch Local: Uzbekistan (uz)｜Gazeta.uz': 'https://gazeta.uz/uz/rss/',
+    'Sino Watch Local: Uzbekistan (uz)｜UzA': 'https://uza.uz/oz/rss',
+    'Sino Watch Local: Uzbekistan (uz)｜Kun.uz': 'https://kun.uz/rss',
+    'Sino Watch Local: Kyrgyzstan (ky/ru)｜Kabar': 'https://kabar.kg/rss.xml',
+    'Sino Watch Local: Kyrgyzstan (ky/ru)｜Kloop': 'https://kloop.kg/feed/',
+    'Sino Watch Local: Kyrgyzstan (ky)｜Azattyk': 'https://www.azattyk.org/api/',
+    'Sino Watch Local: Tajikistan (tg/ru)｜Ozodi': 'https://www.ozodi.org/api/',
+    'Sino Watch Local: Tajikistan (tg)｜Asia-Plus': 'https://asiaplus.news/tg/feed/',
+}
+SINO_WATCH_LOCAL_WEB_SOURCES = {
+    'Sino Watch Local: Kazakhstan (kk)｜Egemen Qazaqstan': 'https://egemen.kz/',
+    'Sino Watch Local: Kazakhstan (kk)｜Aikyn': 'https://aikyn.kz/',
+    'Sino Watch Local: Kazakhstan (ru/kk)｜Vlast.kz': 'https://vlast.kz/',
+    'Sino Watch Local: Uzbekistan (uz)｜Daryo': 'https://daryo.uz/uz',
+    'Sino Watch Local: Uzbekistan (uz)｜Spot': 'https://www.spot.uz/oz/',
+    'Sino Watch Local: Kyrgyzstan (ky)｜Kloop': 'https://ky.kloop.asia/',
+    'Sino Watch Local: Kyrgyzstan (ky/ru)｜Kaktus': 'https://kaktus.media/',
+    'Sino Watch Local: Kyrgyzstan (ky/ru)｜24.kg': 'https://24.kg/',
+    'Sino Watch Local: Tajikistan (tg/ru)｜Avesta': 'https://avesta.tj/',
+    'Sino Watch Local: Turkmenistan (tk)｜Turkmenistan.gov.tm': 'https://turkmenistan.gov.tm/tk',
+    'Sino Watch Local: Turkmenistan (tk)｜TDH': 'https://tdh.gov.tm/tk',
+    'Sino Watch Local: Turkmenistan (tk)｜Orient': 'https://orient.tm/tk',
+    'Sino Watch Local: Turkmenistan (ru)｜Turkmen.news': 'https://turkmen.news/',
+}
+SINO_WATCH_LOCAL_SOURCE_META = {
+    'Sino Watch Local: Kazakhstan (kk)｜Azattyq': {'country': '哈萨克斯坦', 'language': 'kk', 'tier': 2},
+    'Sino Watch Local: Kazakhstan (kk)｜Egemen Qazaqstan': {'country': '哈萨克斯坦', 'language': 'kk', 'tier': 2},
+    'Sino Watch Local: Kazakhstan (kk)｜Aikyn': {'country': '哈萨克斯坦', 'language': 'kk', 'tier': 2},
+    'Sino Watch Local: Kazakhstan (ru/kk)｜Vlast.kz': {'country': '哈萨克斯坦', 'language': 'ru/kk', 'tier': 2},
+    'Sino Watch Local: Uzbekistan (uz)｜Gazeta.uz': {'country': '乌兹别克斯坦', 'language': 'uz', 'tier': 2},
+    'Sino Watch Local: Uzbekistan (uz)｜UzA': {'country': '乌兹别克斯坦', 'language': 'uz', 'tier': 2},
+    'Sino Watch Local: Uzbekistan (uz)｜Kun.uz': {'country': '乌兹别克斯坦', 'language': 'uz', 'tier': 2},
+    'Sino Watch Local: Uzbekistan (uz)｜Daryo': {'country': '乌兹别克斯坦', 'language': 'uz', 'tier': 2},
+    'Sino Watch Local: Uzbekistan (uz)｜Spot': {'country': '乌兹别克斯坦', 'language': 'uz', 'tier': 2},
+    'Sino Watch Local: Kyrgyzstan (ky/ru)｜Kabar': {'country': '吉尔吉斯斯坦', 'language': 'ky/ru', 'tier': 2},
+    'Sino Watch Local: Kyrgyzstan (ky/ru)｜Kloop': {'country': '吉尔吉斯斯坦', 'language': 'ky/ru', 'tier': 2},
+    'Sino Watch Local: Kyrgyzstan (ky)｜Azattyk': {'country': '吉尔吉斯斯坦', 'language': 'ky', 'tier': 2},
+    'Sino Watch Local: Kyrgyzstan (ky)｜Kloop': {'country': '吉尔吉斯斯坦', 'language': 'ky', 'tier': 2},
+    'Sino Watch Local: Kyrgyzstan (ky/ru)｜Kaktus': {'country': '吉尔吉斯斯坦', 'language': 'ky/ru', 'tier': 2},
+    'Sino Watch Local: Kyrgyzstan (ky/ru)｜24.kg': {'country': '吉尔吉斯斯坦', 'language': 'ky/ru', 'tier': 2},
+    'Sino Watch Local: Tajikistan (tg/ru)｜Ozodi': {'country': '塔吉克斯坦', 'language': 'tg/ru', 'tier': 2},
+    'Sino Watch Local: Tajikistan (tg)｜Asia-Plus': {'country': '塔吉克斯坦', 'language': 'tg', 'tier': 2},
+    'Sino Watch Local: Tajikistan (tg/ru)｜Avesta': {'country': '塔吉克斯坦', 'language': 'tg/ru', 'tier': 2},
+    'Sino Watch Local: Turkmenistan (tk)｜Turkmenistan.gov.tm': {'country': '土库曼斯坦', 'language': 'tk', 'tier': 2},
+    'Sino Watch Local: Turkmenistan (tk)｜TDH': {'country': '土库曼斯坦', 'language': 'tk', 'tier': 2},
+    'Sino Watch Local: Turkmenistan (tk)｜Orient': {'country': '土库曼斯坦', 'language': 'tk', 'tier': 2},
+    'Sino Watch Local: Turkmenistan (ru)｜Turkmen.news': {'country': '土库曼斯坦', 'language': 'ru', 'tier': 2},
+}
+SINO_WATCH_LOCAL_SEARCH_META = {
+    'Sino Watch Local Search: Kazakhstan (kk)': {'country': '哈萨克斯坦', 'language': 'kk', 'tier': 2},
+    'Sino Watch Local Search: Uzbekistan (uz)': {'country': '乌兹别克斯坦', 'language': 'uz', 'tier': 2},
+    'Sino Watch Local Search: Kyrgyzstan (ky)': {'country': '吉尔吉斯斯坦', 'language': 'ky', 'tier': 2},
+    'Sino Watch Local Search: Tajikistan (tg)': {'country': '塔吉克斯坦', 'language': 'tg', 'tier': 2},
+    'Sino Watch Local Search: Turkmenistan (tk)': {'country': '土库曼斯坦', 'language': 'tk', 'tier': 2},
+}
+SINO_WATCH_LOCAL_SOURCE_NAMES = (
+    set(SINO_WATCH_LOCAL_FEEDS)
+    | set(SINO_WATCH_LOCAL_WEB_SOURCES)
+    | {group['source'] for group in SINO_WATCH_LOCAL_QUERY_GROUPS}
+)
+
+def sino_watch_local_meta(source_name):
+    source_name = clean_text(source_name)
+    base_name = source_name.split('｜', 1)[0]
+    return (
+        SINO_WATCH_LOCAL_SOURCE_META.get(source_name)
+        or SINO_WATCH_LOCAL_SOURCE_META.get(base_name)
+        or SINO_WATCH_LOCAL_SEARCH_META.get(source_name)
+        or SINO_WATCH_LOCAL_SEARCH_META.get(base_name)
+        or {}
+    )
+
+def annotate_sino_watch_local_item(item):
+    metadata = sino_watch_local_meta(item.get('source', ''))
+    if not metadata:
+        return item
+    item.update({
+        'source_type': 'sino_watch_local',
+        'source_tier': metadata.get('tier', 2),
+        'local_country': metadata.get('country', ''),
+        'local_language': metadata.get('language', ''),
+    })
+    return item
 
 DEEP_DISCOVERY_TRUSTED_PUBLISHERS = [
     'ifri', 'csis', 'center for strategic and international studies',
@@ -2347,6 +2904,7 @@ def neighboring_perspective_region(publisher_text):
             return region
     return ''
 
+
 def is_neighbor_institution_publisher_text(publisher_text):
     return bool(neighboring_perspective_region(publisher_text))
 
@@ -2390,7 +2948,138 @@ DEEP_DISCOVERY_EXCLUDED_PUBLISHERS = [
 ]
 DEEP_DISCOVERY_EXCLUDED_LOWER = [term.lower() for term in DEEP_DISCOVERY_EXCLUDED_PUBLISHERS]
 
+SINO_WATCH_EXCLUDED_PUBLISHER_LOWER = set(DEEP_DISCOVERY_EXCLUDED_LOWER) | {
+    'facebook', 'instagram', 'telegram', 'youtube', 'tiktok', 'reddit',
+    'twitter', 'x.com', 'threads', 'linkedin', 'whatsapp',
+}
+SINO_WATCH_TRUSTED_PUBLISHER_TERMS = set(DEEP_DISCOVERY_TRUSTED_LOWER) | {
+    'azattyq', 'azattyq.org', 'orda.kz', 'vlast.kz', 'kursiv', 'kloop',
+    'cabar.asia', 'fergana', 'novastan', 'the times of central asia',
+    'asia-plus', 'asiaplustj', '24.kg', 'akipress', 'gazeta.uz', 'kun.uz',
+    'spot.uz', 'podrobno.uz', 'the astana times', 'inbusiness.kz',
+    'orda', 'kaktus.media', 'radio azattyq',
+    'associated press', 'ap news', 'bbc', 'the guardian', 'financial times',
+    'reuters', 'bloomberg', 'the economist', 'new york times', 'al jazeera',
+    'france 24', 'kommersant', 'interfax', 'ria novosti', 'tass',
+    'international monetary fund', 'imf', 'european bank for reconstruction',
+    'ebrd', 'food and agriculture organization', 'fao', 'osce',
+    'carec', 'shanghai cooperation organisation', 'united nations',
+    'unrcca', 'unescap', 'freedom house', 'bertelsmann', 'sipri', 'iiss',
+    'human rights watch', 'crisis group', 'international crisis group',
+    'open society', 'rsis', 'saia', 'south asian institute of international affairs',
+}
+SINO_WATCH_TRUSTED_PUBLISHER_LOWER = [term.lower() for term in SINO_WATCH_TRUSTED_PUBLISHER_TERMS]
+
 ACADEMIC_SOURCE_NAMES = {'Academic: Crossref', 'Academic: OpenAlex'}
+
+# The main pipeline already checks a much wider international source network
+# than the dedicated Sino-Central Asia discovery queries. Reuse those records
+# in the controversy-watch sidecar instead of issuing a second request to the
+# same publisher. This is a source scope, not a quality exemption: every
+# reused item still passes the normal China/Central Asia/dispute/depth gates.
+SINO_WATCH_INTERNATIONAL_MEDIA_SOURCES = {
+    'Reuters World', 'AP News', 'BBC World', 'Financial Times World',
+    'Financial Times Asia', 'The Economist Asia', 'The Economist Europe',
+    'New York Times World', 'Washington Post World', 'Nikkei Asia',
+    'The Guardian World', 'Al Jazeera', 'France 24 EN', 'DW English',
+    'Euronews', 'Le Monde', 'Foreign Policy', 'Foreign Affairs',
+    'The Diplomat', 'The Diplomat Central Asia',
+    'The Diplomat China-Central Asia', 'Eurasianet',
+    'The Times of Central Asia', 'CABAR.asia', 'IWPR Central Asia',
+    'Fergana News English', 'New Lines Central Asia',
+    'Global Voices Central Asia', 'The Third Pole', 'Dialogue Earth',
+    'RFE/RL Central Asia', 'Kavkaz.Realii', 'Meduza', 'Riddle Russia',
+    'Lowy Interpreter', 'Middle East Eye', 'NDTV World',
+    'bne IntelliNews Central Asia', 'Anadolu Agency', 'Tehran Times',
+    'Dawn', 'TOLOnews', 'Trend AZ',
+}
+
+SINO_WATCH_INTERNATIONAL_RESEARCH_SOURCES = {
+    'Carnegie Endowment', 'Carnegie Endowment Central Asia',
+    'Carnegie Russia-Eurasia Publications', 'Brookings Russia and Eurasia',
+    'Brookings Central Asia Research', 'CSIS Central Asia',
+    'CSIS Russia and Eurasia Publications', 'Atlantic Council Central Asia',
+    'Stimson Center Eurasia', 'Chatham House Russia and Eurasia',
+    'Chatham House Russia-Eurasia Publications', 'RUSI Central Asia',
+    'RUSI Russia-Eurasia Publications', 'International Crisis Group Central Asia',
+    'ICG Central Asia Publications', 'Human Rights Watch',
+    'Human Rights Watch Central Asia', 'Human Rights Watch Central Asia Country Chapters',
+    'Freedom House Central Asia Country Reports', 'BTI Central Asia Country Reports',
+    'ECFR', 'ECFR Wider Europe Central Asia', 'EUISS', 'SWP Berlin',
+    'Clingendael', 'Ifri Central Asia', 'Ifri Papers Central Asia',
+    'SIPRI Publications', 'IISS Online Analysis', 'IISS Publications Central Asia',
+    'RAND Search Central Asia', 'Wilson Center Search Central Asia',
+    'Kennan Institute Search Central Asia', 'Davis Center Harvard Central Asia',
+    'Davis Center Central Asia Publications', 'FPRI Search Central Asia',
+    'FPRI Eurasia Publications', 'Foreign Policy Centre Search Central Asia',
+    'GMF', 'GMF Central Asia Publications', 'German Marshall Fund',
+    'MERICS Reports Central Asia', 'MERICS Central Asia Search',
+    'IDOS Central Asia Search', 'PONARS Eurasia', 'PONARS Eurasia Policy Memos',
+    'PISM Central Asia Publications', 'IAI Publications', 'Open Society Foundations (Central Asia)',
+    'Central Asia Foundation', 'RSIS Singapore', 'SAIIA',
+}
+
+SINO_WATCH_INTERNATIONAL_MULTILATERAL_SOURCES = {
+    'ADB Central and West Asia', 'ADB Publications', 'EBRD Publications',
+    'EDB Reports', 'World Bank ECA', 'World Bank ECA Publications',
+    'World Bank Documents & Reports', 'IMF Central Asia',
+    'IEA Publications Central Asia', 'OECD Eurasia Publications',
+    'UNDP Eurasia', 'UNDP Europe and Central Asia Publications',
+    'UNESCAP Central Asia Publications', 'IOM Central Asia Publications',
+    'UNODC Central Asia Publications', 'UNICEF Europe Central Asia Reports',
+    'FAO Europe Central Asia Publications', 'OSCE News',
+    'OSCE Academy Policy Briefs', 'UNRCCA', 'UNRCCA Press Releases',
+    'CAREC', 'CAREC Publications', 'CAREC Institute Publications',
+    'CAREC Events', 'SCO News', 'CICA Press Releases',
+}
+
+SINO_WATCH_INTERNATIONAL_NEIGHBOR_SOURCES = (
+    set(NEIGHBORING_COUNTRY_PERSPECTIVE_SOURCES)
+    | {
+        'Russia in Global Affairs Central Asia', 'Ankasam Central Asia',
+        'ORSAM Central Asia', 'Iran Eurasia Studies Central Asia',
+        'IPIS Iran Central Asia', 'Afghan Institute for Strategic Studies Central Asia',
+        'ORF Search Central Asia', 'Observer Research Foundation Central Asia',
+        'Manohar Parrikar IDSA Central Asia', 'Valdai Search Central Asia',
+        'RIAC Search Central Asia', 'OSW Central Asia', 'KAS Central Asia',
+    }
+)
+
+SINO_WATCH_INTERNATIONAL_SOURCE_FAMILIES = {
+    '国际媒体与区域专业媒体': SINO_WATCH_INTERNATIONAL_MEDIA_SOURCES,
+    '国际智库与调查机构': SINO_WATCH_INTERNATIONAL_RESEARCH_SOURCES,
+    '国际组织与多边机构': SINO_WATCH_INTERNATIONAL_MULTILATERAL_SOURCES,
+    '周边国家与跨区域研究机构': SINO_WATCH_INTERNATIONAL_NEIGHBOR_SOURCES,
+    '高质量学术来源': ACADEMIC_SOURCE_NAMES,
+}
+
+# Deep Discovery keys are Google News discovery surfaces whose publisher
+# metadata identifies the actual outlet. They cover international publishers
+# not always reachable through a stable first-party RSS or archive page.
+SINO_WATCH_INTERNATIONAL_DISCOVERY_SOURCES = {
+    source for source in DEEP_DISCOVERY_SOURCES
+    if source.startswith('Deep Discovery: Google News')
+}
+
+SINO_WATCH_INTERNATIONAL_TIER_ONE_SOURCES = (
+    SINO_WATCH_INTERNATIONAL_MEDIA_SOURCES
+    | SINO_WATCH_INTERNATIONAL_RESEARCH_SOURCES
+    | SINO_WATCH_INTERNATIONAL_MULTILATERAL_SOURCES
+    | SINO_WATCH_INTERNATIONAL_NEIGHBOR_SOURCES
+    | ACADEMIC_SOURCE_NAMES
+)
+
+SINO_WATCH_INTERNATIONAL_SOURCE_NAMES = (
+    SINO_WATCH_INTERNATIONAL_MEDIA_SOURCES
+    | SINO_WATCH_INTERNATIONAL_RESEARCH_SOURCES
+    | SINO_WATCH_INTERNATIONAL_MULTILATERAL_SOURCES
+    | SINO_WATCH_INTERNATIONAL_NEIGHBOR_SOURCES
+    | SINO_WATCH_INTERNATIONAL_DISCOVERY_SOURCES
+    | ACADEMIC_SOURCE_NAMES
+    | set(DURABLE_PRESTIGE_DISCOVERY_SOURCES)
+    | set(PDF_REPORT_SOURCES)
+    | REPORT_API_SOURCE_NAMES
+) - set(SINO_WATCH_LOCAL_SOURCE_NAMES)
 
 ACADEMIC_REGIONAL_JOURNAL_WHITELIST = {
     'central asian survey', 'central asian affairs', 'post-soviet affairs',
@@ -2536,7 +3225,9 @@ ACADEMIC_EXCLUDED_TITLE_TERMS = [
     'corrigendum', 'correction', 'erratum', 'retraction', 'obituary',
 ]
 SPECIAL_SOURCE_WARNING_KINDS = {
-    'TELEGRAM', 'PDF_REPORT', 'MEETING', 'ACADEMIC', 'DEEP_DISCOVERY',
+    'TELEGRAM', 'PDF_REPORT', 'MEETING', 'ACADEMIC', 'ACADEMIC_BACKFILL', 'DEEP_DISCOVERY', 'SINO_WATCH',
+    'SINO_WATCH_LOCAL',
+    'SINO_WATCH_INTERNATIONAL',
     'COUNTRY_ASSESSMENT',
 }
 SPECIAL_DATE_REQUIRED_SOURCES = (
@@ -2546,7 +3237,8 @@ SPECIAL_DATE_REQUIRED_SOURCES = (
     set(MEETING_MINUTES_SOURCES) |
     set(CITATION_DERIVED_WEB_SOURCES) |
     COUNTRY_ASSESSMENT_SOURCE_NAMES |
-    ACADEMIC_SOURCE_NAMES
+    ACADEMIC_SOURCE_NAMES |
+    SINO_WATCH_LOCAL_SOURCE_NAMES
 )
 
 HEADERS = {'User-Agent': RUNTIME.user_agent}
@@ -2578,12 +3270,26 @@ def academic_api_url(base_url, params, provider):
 # Sites that routinely block automated list-page access. They remain discoverable
 # through Google News / targeted search, but are not treated as hard-fetch sources.
 DISCOVERY_ONLY_SOURCES = {
-    'ADB Central and West Asia', 'ADB Publications', 'OECD Eurasia Publications',
+    'ADB Central and West Asia', 'OECD Eurasia Publications',
     'Chatham House Russia and Eurasia', 'Chatham House Search Central Asia',
     'Chatham House Russia-Eurasia Publications',
     'Clingendael Search Central Asia', 'IWPR Investigations Central Asia',
     'The Third Pole Central Asia', 'The Third Pole',
-}
+    # Candidate archive/search pages with repeated 403/404 responses. Keep
+    # the institutions discoverable through targeted queries and publication
+    # adapters, but do not hard-fetch the blocked list pages every day.
+    'IMF Central Asia', 'Ifri Central Asia', 'MERICS China Central Asia',
+    'RIAC Search Central Asia', 'RUSI Search Central Asia',
+    'Stimson Search Central Asia', 'Manohar Parrikar IDSA Central Asia',
+} | REPORT_DISCOVERY_ONLY_SOURCES
+
+
+def get_active_candidate_web_sources():
+    """Return candidate pages that are still suitable for direct probing."""
+    return {
+        source: url for source, url in CANDIDATE_WEB_SOURCES.items()
+        if source not in DISCOVERY_ONLY_SOURCES
+    }
 
 def request_academic_api(url, provider, timeout=30):
     """Polite provider adapter for APIs that enforce global per-client limits."""
@@ -2743,10 +3449,14 @@ S_TIER_DAILY_WEB_SOURCES = {
 # discovery, sitemap, search, or dedicated publication adapters.
 KNOWN_DEAD_FEED_SOURCES = {
     'Eurasianet', 'CSIS Central Asia', 'Chatham House Russia and Eurasia',
-    'Kabar KG', 'Kazinform', 'Reuters World', 'Oxus Society RSS',
+    'Kabar KG', 'Kazinform', 'Reuters World', 'Oxus Society', 'Oxus Society RSS',
     'The Third Pole', 'IWPR Central Asia', 'IISS Online Analysis',
     'ISRS Uzbekistan', 'Clingendael', 'bne IntelliNews Central Asia',
     'Regnum Agency',
+    # Repeated 404/403/SSL failures confirmed during the 2026-09-11—10-05
+    # maintenance window. The institutions remain covered elsewhere.
+    'Central Asia Program (Wilson Center)',
+    'Eurasian Research Institute', 'Human Rights Watch', 'KAS Central Asia',
 }
 
 RESTORED_WEB_SOURCES = set(S_TIER_DAILY_WEB_SOURCES)
@@ -2771,6 +3481,388 @@ def get_active_web_sources():
             or source in force_web and source not in DISCOVERY_ONLY_SOURCES
         }
     return {source: url for source, url in WEB_SOURCES.items() if source not in DISCOVERY_ONLY_SOURCES}
+
+
+# Source maintenance is deliberately conservative.  A confirmed-dead or
+# discovery-only entry is not retried against its old URL merely because time
+# has passed.  A new URL may be probed only after it has been recorded here as
+# a verified public alternative during an explicit maintenance pass.  A
+# stable-skip entry is different: it may receive a bounded, low-frequency
+# check against its existing public endpoint.
+SOURCE_MAINTENANCE_REPAIR_CANDIDATES = {
+    # Keep this registry empty until an official replacement URL has been
+    # checked.  The 2026-10-07 repairs are already part of FEEDS/WEB_SOURCES.
+}
+
+SOURCE_MAINTENANCE_COVERAGE_ALIASES = {
+    'ADB Central and West Asia': ('ADB Publications',),
+    'Chatham House Search Central Asia': ('Chatham House Russia-Eurasia Publications',),
+    'Chatham House Russia and Eurasia': ('Chatham House Russia-Eurasia Publications',),
+    'CSIS Central Asia': ('CSIS Russia and Eurasia Publications',),
+    'Human Rights Watch': ('Human Rights Watch Central Asia',),
+    'Human Rights Watch Central Asia': ('Human Rights Watch Central Asia',),
+    'IISS Online Analysis': ('IISS Publications Central Asia',),
+    'KAS Central Asia': ('KAS Central Asia Publications',),
+    'MERICS China Central Asia': ('MERICS Reports Central Asia',),
+    'Ifri Central Asia': ('Ifri Papers Central Asia',),
+    'RUSI Search Central Asia': ('RUSI Russia-Eurasia Publications',),
+}
+
+
+def _maintenance_key(kind, source):
+    return str(kind) + '|' + str(source)
+
+
+def _maintenance_date(value):
+    try:
+        return datetime.date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _maintenance_interval_days(status):
+    if status in {'stable-skip', 'paused'}:
+        return SOURCE_MAINTENANCE_SKIP_INTERVAL_DAYS
+    return SOURCE_MAINTENANCE_DISCOVERY_INTERVAL_DAYS
+
+
+def _maintenance_status(kind, source):
+    if kind == 'RSS':
+        if source not in skipped_feed_sources():
+            return 'active'
+        if source in KNOWN_DEAD_FEED_SOURCES:
+            return 'known-dead'
+        if source in STABLE_SKIP_FEED_SOURCES:
+            return 'stable-skip'
+        return 'paused'
+    if kind == 'WEB':
+        if source in get_active_web_sources():
+            return 'active'
+        if source in DISCOVERY_ONLY_SOURCES:
+            return 'discovery-only'
+        if source in STABLE_SKIP_WEB_SOURCES:
+            return 'stable-skip'
+        return 'paused'
+    if kind == 'CANDIDATE_WEB':
+        if source in get_active_candidate_web_sources():
+            return 'active'
+        return 'discovery-only'
+    return 'paused'
+
+
+def source_maintenance_inventory():
+    """Return paused source entries eligible for low-frequency maintenance.
+
+    This inventory describes dispatch state, not source quality.  Active
+    sources are intentionally omitted: their daily health is already recorded
+    by the normal fetch jobs.
+    """
+    inventory = []
+    skipped_feeds = skipped_feed_sources()
+    active_web = get_active_web_sources()
+    active_candidates = get_active_candidate_web_sources()
+    for source, urls in FEEDS.items():
+        if source in skipped_feeds:
+            inventory.append({
+                'key': _maintenance_key('RSS', source),
+                'kind': 'RSS',
+                'source': source,
+                'urls': list(urls),
+                'status': _maintenance_status('RSS', source),
+            })
+    for source, url in WEB_SOURCES.items():
+        if source not in active_web:
+            inventory.append({
+                'key': _maintenance_key('WEB', source),
+                'kind': 'WEB',
+                'source': source,
+                'urls': [url],
+                'status': _maintenance_status('WEB', source),
+            })
+    for source, url in CANDIDATE_WEB_SOURCES.items():
+        if source not in active_candidates:
+            inventory.append({
+                'key': _maintenance_key('CANDIDATE_WEB', source),
+                'kind': 'CANDIDATE_WEB',
+                'source': source,
+                'urls': [url],
+                'status': _maintenance_status('CANDIDATE_WEB', source),
+            })
+    return inventory
+
+
+def _maintenance_alternative_coverage(kind, source):
+    """Describe an already active route that covers the same publisher."""
+    coverage = []
+    if kind == 'RSS' and source in WEB_SOURCES:
+        if source in get_active_web_sources():
+            coverage.append({'kind': 'WEB', 'url': WEB_SOURCES[source], 'mode': 'active-web'})
+    if kind == 'WEB' and source in FEEDS:
+        if source not in skipped_feed_sources():
+            coverage.extend(
+                {'kind': 'RSS', 'url': url, 'mode': 'active-rss'}
+                for url in FEEDS[source]
+            )
+    report_names = SOURCE_MAINTENANCE_COVERAGE_ALIASES.get(source, (source,))
+    for report_name in report_names:
+        if (report_name in PDF_REPORT_SOURCES
+                and REPORT_SOURCE_ACCESS_MODE.get(report_name) != 'discovery-only'):
+            coverage.append({
+                'kind': 'REPORT',
+                'source': report_name,
+                'url': PDF_REPORT_SOURCES[report_name],
+                'mode': 'report-adapter',
+            })
+    return coverage
+
+
+def _load_source_maintenance_state():
+    try:
+        if SOURCE_MAINTENANCE_FILE.exists():
+            payload = json.loads(SOURCE_MAINTENANCE_FILE.read_text(encoding='utf-8'))
+            if isinstance(payload, dict) and isinstance(payload.get('sources'), dict):
+                return payload
+    except (OSError, ValueError, TypeError):
+        pass
+    return {'version': SOURCE_MAINTENANCE_STATE_VERSION, 'sources': {}}
+
+
+def _save_source_maintenance_state(state):
+    state['version'] = SOURCE_MAINTENANCE_STATE_VERSION
+    atomic_write_json(SOURCE_MAINTENANCE_FILE, state, default=str)
+
+
+def _maintenance_due(record, today=None):
+    today = today or TODAY
+    due = _maintenance_date(record.get('next_due'))
+    return due is None or due <= today
+
+
+def _maintenance_next_due(today, status):
+    return (today + datetime.timedelta(days=_maintenance_interval_days(status))).isoformat()
+
+
+def _maintenance_probe_rss(url):
+    response = request_url(url, timeout=10, retries=0)
+    response.raise_for_status()
+    parsed = feedparser.parse(response.text)
+    count = sum(
+        1 for entry in parsed.entries[:100]
+        if entry.get('title') and entry.get('link')
+        and parse_item_published_date({
+            'published': entry.get('published') or entry.get('updated', ''),
+        }) is not None
+    )
+    if count <= 0:
+        raise RuntimeError('RSS returned no usable dated entries')
+    return count
+
+
+def _maintenance_probe_web(url, source_name=''):
+    response = request_url(url, timeout=10, retries=0)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, 'lxml')
+    adapter = INSTITUTION_ADAPTER_CONFIG.get(source_name, {})
+    selectors = SOURCE_WEB_SELECTORS.get(
+        source_name, adapter.get('selectors') or DEFAULT_WEB_SELECTORS,
+    )
+    required_paths = SOURCE_WEB_REQUIRED_PATHS.get(source_name, adapter.get('allowed_paths', []))
+    links = set()
+    for selector in selectors:
+        for element in soup.select(selector)[:100]:
+            if element.find_parent(['nav', 'footer']):
+                continue
+            href = element.get('href', '')
+            title = clean_web_title(element.get_text(' ', strip=True))
+            if not href or not title or is_generic_title(title):
+                continue
+            href = urljoin(url, href).split('#')[0]
+            if urllib.parse.urlparse(href).scheme not in {'http', 'https'} or is_generic_url(href):
+                continue
+            if required_paths and not any(path in href.lower() for path in required_paths):
+                continue
+            links.add(href)
+    if not links:
+        raise RuntimeError('web page returned no usable publication links')
+    return len(links)
+
+
+def _maintenance_probe(candidate):
+    if candidate.get('kind') == 'RSS':
+        return _maintenance_probe_rss(candidate['url'])
+    if candidate.get('kind') == 'WEB':
+        return _maintenance_probe_web(candidate['url'], candidate.get('source', ''))
+    raise RuntimeError('unsupported maintenance candidate kind')
+
+
+def run_source_maintenance(max_probes=SOURCE_MAINTENANCE_MAX_PROBES):
+    """Run a bounded, low-frequency source maintenance pass.
+
+    The pass never probes an old confirmed-dead or discovery-only URL by
+    default.  It records whether an active alternative already covers the
+    publisher, rechecks stable-skip endpoints at low frequency, and probes
+    only URLs explicitly entered in SOURCE_MAINTENANCE_REPAIR_CANDIDATES for
+    confirmed-dead/discovery-only entries.  Successful probes are evidence for
+    a later adapter change, not an automatic promotion into the daily source
+    pool.
+    """
+    state = _load_source_maintenance_state()
+    source_state = state.setdefault('sources', {})
+    inventory = source_maintenance_inventory()
+    due = []
+    summary = {
+        'queued': len(inventory),
+        'due': 0,
+        'probed': 0,
+        'success': 0,
+        'failed': 0,
+        'covered': 0,
+        'awaiting_repair': 0,
+        'promotable': 0,
+        'records': [],
+    }
+    for entry in inventory:
+        if not isinstance(source_state.get(entry['key']), dict):
+            source_state.pop(entry['key'], None)
+        record = source_state.setdefault(entry['key'], {
+            'kind': entry['kind'],
+            'source': entry['source'],
+            'status': entry['status'],
+            'created': str(TODAY),
+            'next_due': str(TODAY),
+            'attempts': 0,
+            'successes': 0,
+        })
+        record.update({'kind': entry['kind'], 'source': entry['source'], 'status': entry['status']})
+        # Early queue versions failed before issuing an HTTP request. Keep
+        # the old logs, but do not make those dispatch errors wait a week.
+        if record.get('last_error') == 'unsupported maintenance candidate kind':
+            record['invalidated_dispatch_error'] = record.pop('last_error')
+            record['last_error_type'] = 'dispatch-error'
+            record['last_result'] = 'dispatch-error-invalidated'
+            record['next_due'] = str(TODAY)
+        if not isinstance(record.get('endpoint_checks'), dict):
+            record['endpoint_checks'] = {}
+            record['successes'] = 0
+            record.pop('recommendation', None)
+        if _maintenance_due(record):
+            due.append((entry, record))
+    summary['due'] = len(due)
+    due.sort(key=lambda pair: (
+        _maintenance_date(pair[1].get('next_due')) or datetime.date.min,
+        0 if pair[0]['status'] == 'stable-skip' else 1,
+        0 if pair[0]['status'] == 'known-dead' else 1,
+        pair[0]['key'],
+    ))
+    probes_left = max(0, int(max_probes))
+    for entry, record in due:
+        key = entry['key']
+        coverage = _maintenance_alternative_coverage(entry['kind'], entry['source'])
+        candidates = [
+            dict(candidate, source=entry['source'])
+            for candidate in SOURCE_MAINTENANCE_REPAIR_CANDIDATES.get(key, [])
+            if isinstance(candidate, dict) and candidate.get('kind') in {'RSS', 'WEB'}
+            and urllib.parse.urlparse(candidate.get('url', '')).scheme in {'http', 'https'}
+            and (entry['status'] == 'stable-skip' or candidate['url'] not in entry['urls'])
+        ]
+        # A stable-skip entry is not a confirmed dead link.  It may be
+        # rechecked at low frequency on its existing public endpoint.  Known
+        # dead and discovery-only entries require a newly verified alternative
+        # before any probe is attempted.
+        if not candidates and entry['status'] == 'stable-skip':
+            candidates = [
+                {'kind': entry['kind'], 'source': entry['source'],
+                 'url': url, 'mode': 'existing-endpoint'}
+                for url in entry.get('urls', [])
+                if url
+            ]
+        record['last_evaluated'] = str(TODAY)
+        record['coverage'] = coverage
+        record['repair_candidates'] = candidates
+        if coverage:
+            record['last_result'] = 'covered-via-alternative'
+            record['next_due'] = _maintenance_next_due(TODAY, entry['status'])
+            summary['covered'] += 1
+            summary['records'].append((entry, '已配置替代采集入口（不代表稳定或有独立贡献）'))
+            continue
+        if not candidates:
+            record['last_result'] = 'awaiting-repair-path'
+            record['next_due'] = _maintenance_next_due(TODAY, entry['status'])
+            summary['awaiting_repair'] += 1
+            summary['records'].append((entry, '待登记官方替代入口'))
+            continue
+        if probes_left <= 0:
+            record['last_result'] = 'deferred-budget'
+            summary['records'].append((entry, '本轮超出重测预算'))
+            continue
+        for candidate in candidates:
+            if probes_left <= 0:
+                break
+            probes_left -= 1
+            summary['probed'] += 1
+            record['attempts'] = int(record.get('attempts', 0)) + 1
+            endpoint_key = _maintenance_key(candidate['kind'], candidate['url'])
+            endpoint = record['endpoint_checks'].setdefault(endpoint_key, {})
+            try:
+                count = _maintenance_probe(candidate)
+                successes = int(endpoint.get('successes', 0))
+                if endpoint.get('last_result') != 'success':
+                    successes = 1
+                elif endpoint.get('last_success_date') != str(TODAY):
+                    successes += 1
+                endpoint.update({
+                    'successes': successes, 'last_result': 'success',
+                    'last_success_date': str(TODAY), 'last_item_count': count,
+                })
+                record['successes'] = successes
+                record['last_result'] = 'success'
+                record.pop('last_error', None)
+                record.pop('last_error_type', None)
+                record.pop('recommendation', None)
+                record['last_success_url'] = candidate.get('url', '')
+                record['last_item_count'] = count
+                record['next_due'] = _maintenance_next_due(TODAY, entry['status'])
+                summary['success'] += 1
+                if record['successes'] >= 2:
+                    record['recommendation'] = 'ready-for-adapter-review'
+                    summary['promotable'] += 1
+                summary['records'].append((entry, '入口重测成功：' + str(count) + ' 条｜' + candidate['url']))
+                break
+            except Exception as exc:
+                endpoint.update({'successes': 0, 'last_result': 'failure'})
+                record['successes'] = 0
+                record.pop('recommendation', None)
+                record['last_result'] = 'failure'
+                record['last_error'] = short_error(exc)
+                record['last_error_type'] = classify_access_error(record['last_error'])
+                record['next_due'] = _maintenance_next_due(TODAY, entry['status'])
+                summary['failed'] += 1
+                summary['records'].append((entry, '入口重测失败：' + record['last_error_type'] + '｜' + candidate['url']))
+    _save_source_maintenance_state(state)
+    lines = [
+        '中亚研究每日简报 - 低频入口维护日志',
+        '日期：' + str(TODAY),
+        '',
+        '维护原则：先确认公开替代入口，再重测；不盲目重试旧死链。',
+        '维护队列：' + str(summary['queued']) + '；本轮到期：' + str(summary['due'])
+        + '；实际重测：' + str(summary['probed']) + '；重测成功：' + str(summary['success'])
+        + '；重测失败：' + str(summary['failed']) + '；替代入口覆盖：' + str(summary['covered'])
+        + '；待登记替代入口：' + str(summary['awaiting_repair'])
+        + '；达到适配器复核条件：' + str(summary['promotable']),
+        '',
+    ]
+    for entry, result in summary['records']:
+        lines.append('- [' + entry['kind'] + '] ' + entry['source'] + '｜' + result)
+    atomic_write_text(SOURCE_MAINTENANCE_LOG, '\n'.join(lines) + '\n')
+    return summary
+
+
+def run_source_maintenance_safely():
+    try:
+        return run_source_maintenance()
+    except Exception as exc:
+        record_source_warning('SOURCE_MAINTENANCE', 'maintenance queue', '', exc)
+        return {'error': short_error(exc)}
 
 GENERIC_WEB_TITLES = {
     'central asia', 'europe and central asia', 'news', 'news centre',
@@ -3444,6 +4536,133 @@ def clean_rss_summary_html(summary):
     text = re.sub(r'\s*(?:Read more|Continue reading|阅读更多)\s*[»›].*$', '', text, flags=re.I)
     return clean_text(text)
 
+
+SUMMARY_BOILERPLATE_TERMS = [
+    'download report', 'download full report', 'download the report',
+    'скачать отчет', 'скачать полный отчет', '下载报告', '下载完整报告',
+    'read more from', 'view full coverage on google news',
+    'subscribe to read', 'subscribe to continue', 'sign in to continue',
+    'continue reading', 'read more', 'learn more', 'related content',
+]
+SUMMARY_BOILERPLATE_LOWER = [term.lower() for term in SUMMARY_BOILERPLATE_TERMS]
+
+SUMMARY_AUTHOR_LABEL_RE = r'(?:authors?|авторы|автор(?:ы)?|作者)'
+SUMMARY_MENTOR_LABEL_RE = r'(?:mentors?|mentor|ментор|导师)'
+SUMMARY_DOWNLOAD_RE = r'(?:download(?:\s+(?:the|full))?\s+report|скачать(?:\s+полный)?\s+отчет|下载(?:完整)?报告)'
+SUMMARY_SUBSTANTIVE_MARKER_RE = (
+    r'(?:\|\s*|'
+    r'\b(?:since|this|the|in this|the report|the study|this report|this study)\b|'
+    r'\b(?:данная|настоящ|в настоящей|этот|это исследование)\w*\b|'
+    r'(?:本文|本报告|本研究|该报告|该研究))'
+)
+
+
+def normalize_summary_display_text(summary, item=None):
+    """Remove publisher-card metadata before a summary is translated/rendered."""
+    text = clean_rss_summary_html(summary)
+    if not text:
+        return ''
+
+    # Academic feeds often prepend venue/author fields with pipe separators;
+    # those fields are already rendered in dedicated bibliographic lines.
+    text = re.sub(
+        r'^\s*[^|]{2,120}\s*\|\s*(?=' + SUMMARY_AUTHOR_LABEL_RE + r'\s*[:：])',
+        '', text, flags=re.I,
+    )
+    # Oxus and similar report cards may stack author, mentor and download
+    # controls ahead of the first substantive sentence, without separators.
+    for _ in range(4):
+        previous = text
+        text = re.sub(
+            r'^\s*' + SUMMARY_AUTHOR_LABEL_RE + r'\s*[:：].*?(?=' + SUMMARY_SUBSTANTIVE_MARKER_RE + r')',
+            '', text, flags=re.I,
+        )
+        text = re.sub(
+            r'^\s*' + SUMMARY_MENTOR_LABEL_RE + r'\s*[:：].*?(?=' + SUMMARY_SUBSTANTIVE_MARKER_RE + r')',
+            '', text, flags=re.I,
+        )
+        text = re.sub(r'^\s*' + SUMMARY_DOWNLOAD_RE + r'\s*[:：-]?\s*', '', text, flags=re.I)
+        text = re.sub(r'^\s*(?:\|\s*)+', '', text)
+        if text == previous:
+            break
+
+    # A title repeated at the head of an RSS description is not abstract text.
+    title = clean_title((item or {}).get('title', ''))
+    if title and text.lower().startswith(title.lower()):
+        text = text[len(title):].lstrip(' :：-–—|')
+    return clean_text(text)
+
+
+def summary_has_terminal_punctuation(text):
+    return bool(re.search(r'[。！？!?](?:["”’»)\]]*)\s*$', text or '')) or bool(
+        re.search(r'\.(?:["”’»)\]]*)\s*$', text or '')
+    )
+
+
+def summary_needs_continuation_marker(source_summary):
+    """Flag fixed-length/card excerpts that end before a complete sentence."""
+    text = clean_text(source_summary)
+    if not text:
+        return False
+    if re.search(r'(?:\.{2,}|…{1,3})\s*$', text):
+        return True
+    return len(text) >= 120 and not summary_has_terminal_punctuation(text)
+
+
+def summary_is_boilerplate(summary):
+    """Detect card/navigation residue that should not outrank article prose."""
+    text = clean_rss_summary_html(summary)
+    if not text:
+        return True
+    lowered = text.lower()
+    if any(lowered.startswith(term) for term in SUMMARY_BOILERPLATE_LOWER):
+        return True
+    if len(text) < 120 and any(term in lowered for term in SUMMARY_BOILERPLATE_LOWER):
+        return True
+    return False
+
+
+def summary_context_mismatch(title, summary):
+    """Detect an obvious publisher-card summary from a different document.
+
+    The check is deliberately conservative. It only rejects a summary when
+    the title has a strong Central Asia anchor, the summary has none, and the
+    two texts share no meaningful title tokens. Generic titles are untouched.
+    """
+    title_text = clean_text(title or '')
+    summary_text = clean_text(summary or '')
+    if not title_text or not summary_text:
+        return False
+    if not any(term in title_text.lower() for term in STRONG_CA_ANCHOR_LOWER):
+        return False
+    if any(term in summary_text.lower() for term in STRONG_CA_ANCHOR_LOWER):
+        return False
+    title_tokens = set(title_signature_tokens(title_text))
+    summary_tokens = set(title_signature_tokens(summary_text))
+    if not title_tokens or not summary_tokens:
+        return False
+    return not (title_tokens & summary_tokens)
+
+
+def best_metadata_summary(metadata, *, prefer_body=False):
+    """Choose a substantive body excerpt over publication-card boilerplate."""
+    metadata = metadata or {}
+    title = clean_text(metadata.get('title', ''))
+    meta_summary = clean_rss_summary_html(metadata.get('summary', ''))
+    body_summary = clean_rss_summary_html(metadata.get('body_summary', ''))
+    if title and summary_context_mismatch(title, meta_summary):
+        meta_summary = ''
+    if title and summary_context_mismatch(title, body_summary):
+        body_summary = ''
+    if body_summary and not summary_is_boilerplate(body_summary):
+        if (
+            prefer_body
+            or summary_is_boilerplate(meta_summary)
+            or len(body_summary) >= len(meta_summary) + 80
+        ):
+            return body_summary
+    return meta_summary or body_summary
+
 def enrich_item_from_article(item):
     """Fetch original-page metadata after link resolution to improve clues and depth signals."""
     if not item or item.get('enriched'):
@@ -3473,7 +4692,18 @@ def enrich_item_from_article(item):
                     metadata = landing_metadata
         item['enriched'] = True
         old_summary = clean_rss_summary_html(item.get('summary', ''))
-        new_summary = clean_text(metadata.get('summary', ''))
+        if summary_context_mismatch(item.get('title', ''), old_summary):
+            old_summary = ''
+            item['summary'] = ''
+            item['summary_mismatch'] = True
+            item['summary_enriched'] = False
+        prefer_body = (
+            item.get('source_type') == 'institution_publication'
+            or item.get('source') in (set(PDF_REPORT_SOURCES) | REPORT_API_SOURCE_NAMES)
+        )
+        new_summary = best_metadata_summary(metadata, prefer_body=prefer_body)
+        if metadata.get('summary_mismatch'):
+            item['summary_mismatch'] = True
         if new_summary and '%pdf-' not in new_summary.lower() and len(new_summary) >= max(80, len(old_summary) + 20):
             item['summary'] = new_summary[:500]
             item['summary_enriched'] = True
@@ -3613,6 +4843,8 @@ def update_candidate_history(candidate_web_jobs):
     }
     today = str(TODAY)
     for source in CANDIDATE_WEB_SOURCES:
+        if source not in counts:
+            continue
         records = [
             record for record in history.get(source, [])
             if record.get('date') != today
@@ -3637,7 +4869,7 @@ def job_item_total(jobs):
 def extra_source_scope_text(extra_source_jobs):
     parts = []
     for group in extra_source_jobs or []:
-        unit = '查询任务' if group.get('kind') in {'DEEP_DISCOVERY', 'ACADEMIC'} else '来源'
+        unit = '查询任务' if group.get('kind') in {'DEEP_DISCOVERY', 'ACADEMIC', 'SINO_WATCH'} else '来源'
         parts.append(
             group['label'] + ' ' + str(jobs_with_items(group['jobs'])) + '/' + str(group['total'])
             + ' 个' + unit + '返回非空'
@@ -3645,6 +4877,111 @@ def extra_source_scope_text(extra_source_jobs):
     if not parts:
         return ''
     return '；' + '；'.join(parts)
+
+
+def format_public_statistics_line(
+    *,
+    active_feed_sources=0,
+    active_feed_count=0,
+    total_feed_count=0,
+    active_web_sources=0,
+    active_web_count=0,
+    total_web_count=0,
+    candidate_text='',
+    extra_text='',
+    cross_day_skipped=0,
+    public_candidate_count=0,
+    published_count=0,
+    compact=False,
+    rescreen=False,
+    rescreen_source_count=None,
+):
+    """Render public statistics from the same counts used by audit output."""
+    if rescreen:
+        source_count = public_candidate_count if rescreen_source_count is None else rescreen_source_count
+        return (
+            '检索诊断：本次未重新联网；读取当日已保存入选缓存 '
+            + str(source_count) + ' 条，重新通过公开门禁 '
+            + str(public_candidate_count) + ' 条，最终公开推荐 '
+            + str(published_count) + ' 条；联网抓取统计见 source_health_'
+            + str(TODAY) + '.log，本次重筛记录见 rescreen_audit_'
+            + str(TODAY) + '.json。'
+        )
+    if compact:
+        line = (
+            '检索诊断：RSS 有效源 ' + str(active_feed_sources) + '/' + str(active_feed_count)
+            + '，网页有效源 ' + str(active_web_sources) + '/' + str(active_web_count)
+            + '，公开门禁候选 ' + str(public_candidate_count)
+            + ' 条，最终公开推荐 ' + str(published_count)
+            + ' 条，跨日重复排除 ' + str(cross_day_skipped) + ' 条'
+        )
+        if published_count == 0:
+            line += '；0 条表示本轮没有新的合格公开材料'
+        return line + '。'
+    return (
+        '本期抓取范围：启用 ' + str(active_feed_count) + '/' + str(total_feed_count)
+        + ' 个 RSS 源、' + str(active_web_count) + '/' + str(total_web_count)
+        + ' 个网页源；有效返回：RSS ' + str(active_feed_sources) + '/' + str(active_feed_count)
+        + '，网页 ' + str(active_web_sources) + '/' + str(active_web_count)
+        + candidate_text + extra_text
+        + '；跨日重复排除 ' + str(cross_day_skipped)
+        + ' 条；公开门禁候选 ' + str(public_candidate_count)
+        + ' 条；最终公开推荐 ' + str(published_count) + ' 条。'
+    )
+
+
+def load_sino_watch_stats():
+    """Load same-day Sino-Central Asia watch counters for rendering."""
+    stats_path = find_output_file(SINO_WATCH_JSON_FILE)
+    if not stats_path.exists():
+        return None
+    try:
+        payload = json.loads(stats_path.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get('date') != str(TODAY):
+        return None
+    stats = payload.get('stats')
+    if not isinstance(stats, dict):
+        return None
+    stats = dict(stats)
+    items = payload.get('items')
+    if 'selected' not in stats and isinstance(items, list):
+        stats['selected'] = len(items)
+    return stats
+
+
+def format_auxiliary_statistics_lines(internal_review_count, sino_watch_stats=None):
+    """Render daily counts for the two non-public material entrances."""
+    lines = [
+        ('- 公众号稳妥版：内部备查保留 ' if WECHAT_SAFE_MODE else '- 内部备查：')
+        + str(internal_review_count) + ' 条；详情见 ' + INTERNAL_REVIEW_FILE.name + '。',
+    ]
+    if sino_watch_stats is None:
+        lines.append('- 涉华负面舆情旁路：未启用或当日统计文件不可用；详情见 ' + SINO_WATCH_FILE.name + '。')
+        return lines
+    stats = sino_watch_stats
+    lines.append(
+        '- 涉华负面舆情旁路：抓取 ' + str(stats.get('fetched', 0))
+        + ' 条；信号通过 ' + str(stats.get('signal_pass', 0))
+        + ' 条；原文富集候选 ' + str(stats.get('prefiltered', 0))
+        + ' 条；质量门槛通过 ' + str(stats.get('quality_pass', 0))
+        + ' 条；跨日重复排除 ' + str(stats.get('history_skipped', 0))
+        + ' 条；本轮重复排除 ' + str(stats.get('same_run_skipped', 0))
+        + ' 条；今日新增 ' + str(stats.get('selected', 0))
+        + ' 条；详情见 ' + SINO_WATCH_FILE.name + '。'
+    )
+    lead_stats = stats.get('lead_pool') or {}
+    if lead_stats:
+        lead_rejected = sum(int(value or 0) for value in (lead_stats.get('rejection_reasons') or {}).values())
+        lines.append(
+            '- 宽口径待核验线索：核心信号通过 ' + str(lead_stats.get('signal_pass', 0))
+            + ' 条；进入候选 ' + str(lead_stats.get('prefiltered', 0))
+            + ' 条；严格门槛未通过 ' + str(lead_rejected)
+            + ' 条；今日新增 ' + str(lead_stats.get('selected', 0))
+            + ' 条；详情见 ' + SINO_WATCH_LEAD_POOL_FILE.name + '。'
+        )
+    return lines
 
 def write_source_health_log(feed_jobs, web_jobs, active_feed_count, active_web_count, candidate_web_jobs=None, extra_source_jobs=None, near_misses=None):
     candidate_web_jobs = candidate_web_jobs or []
@@ -3669,7 +5006,23 @@ def write_source_health_log(feed_jobs, web_jobs, active_feed_count, active_web_c
                  + '；429=' + str(FETCH_DIAG.get('status_429', 0))
                  + '；5xx=' + str(FETCH_DIAG.get('status_5xx', 0))
                  + '；超时=' + str(FETCH_DIAG.get('timeouts', 0)))
-    lines.append('候选网页源：' + ('启用 ' + str(len(CANDIDATE_WEB_SOURCES)) if TEST_CANDIDATE_SOURCES else '未启用'))
+    active_candidate_sources = get_active_candidate_web_sources()
+    lines.append('候选网页源：' + ('启用 ' + str(len(active_candidate_sources)) + ' / 配置 ' + str(len(CANDIDATE_WEB_SOURCES)) if TEST_CANDIDATE_SOURCES else '未启用'))
+    maintenance = SOURCE_MAINTENANCE_SUMMARY or {}
+    if maintenance.get('error'):
+        lines.append('低频入口维护异常（未中断主采集）：' + maintenance['error'])
+    elif maintenance:
+        lines.append(
+            '低频入口维护：队列 ' + str(maintenance.get('queued', 0))
+            + '；本轮到期 ' + str(maintenance.get('due', 0))
+            + '；实际重测 ' + str(maintenance.get('probed', 0))
+            + '；成功 ' + str(maintenance.get('success', 0))
+            + '；失败 ' + str(maintenance.get('failed', 0))
+            + '；替代入口覆盖 ' + str(maintenance.get('covered', 0))
+            + '；待修复 ' + str(maintenance.get('awaiting_repair', 0))
+            + '；适配器复核 ' + str(maintenance.get('promotable', 0))
+            + '；详情见 source_maintenance_' + str(TODAY) + '.log'
+        )
     if extra_source_jobs:
         lines.append('专项补强源：' + '；'.join(group['label'] + ' 启用 ' + str(group['total']) for group in extra_source_jobs))
     lines.append('')
@@ -3687,7 +5040,7 @@ def write_source_health_log(feed_jobs, web_jobs, active_feed_count, active_web_c
             + str(job_item_total(candidate_web_jobs)) + ' 条（含首页旧链接，尚未过滤）'
         )
     for group in extra_source_jobs:
-        unit = '查询任务' if group.get('kind') in {'DEEP_DISCOVERY', 'ACADEMIC'} else '来源'
+        unit = '查询任务' if group.get('kind') in {'DEEP_DISCOVERY', 'ACADEMIC', 'SINO_WATCH'} else '来源'
         suffix = '；任务数不等于出版方数量' if unit == '查询任务' else ''
         lines.append(
             group['label'] + ' 返回非空' + unit + '：' + str(jobs_with_items(group['jobs']))
@@ -3739,6 +5092,14 @@ def write_source_health_log(feed_jobs, web_jobs, active_feed_count, active_web_c
         if not group['jobs']:
             continue
         lines.append(group['label'] + '本次返回详情：')
+        if group.get('reuse_only'):
+            lines.append('- 说明：本组只复用主流程已经抓取的条目，不重复请求同一国际出版方。')
+            family_counts = group.get('family_counts') or {}
+            if family_counts:
+                lines.append('- 来源门类：' + '；'.join(
+                    str(key) + ' ' + str(value) + ' 条'
+                    for key, value in sorted(family_counts.items(), key=lambda pair: (-pair[1], pair[0]))
+                ))
         for source, count in sorted(group['jobs']):
             lines.append('- ' + source + ': ' + str(count))
         lines.append('')
@@ -3789,6 +5150,95 @@ def canonical_source_distribution(items, limit=12):
     return '；'.join(key.split(':', 1)[-1] + '=' + str(count) for key, count in ranked)
 
 
+def source_performance_snapshot(
+    all_items,
+    relevant_items,
+    history_deduped_items,
+    public_eligible_items,
+    published_items,
+    limit=20,
+):
+    """Return a compact per-source funnel without changing selection behavior.
+
+    The same document can surface more than once through RSS, discovery, or a
+    publisher page. Count each source/document identity once per stage so the
+    health log measures contribution rather than transport volume.
+    """
+    stages = (
+        ('raw', all_items),
+        ('relevant', relevant_items),
+        ('candidate', history_deduped_items),
+        ('eligible', public_eligible_items),
+        ('published', published_items),
+    )
+    rows = {}
+    for stage_name, items in stages:
+        seen = set()
+        for item in items or []:
+            source = public_source_key(item) or clean_text(item.get('source', '')).lower()
+            identity = normalize_key(item) or normalize_title_key(item.get('title', ''))
+            if not source or not identity:
+                continue
+            identity_key = (source, identity)
+            if identity_key in seen:
+                continue
+            seen.add(identity_key)
+            row = rows.setdefault(source, {
+                'source': source,
+                'raw': 0,
+                'relevant': 0,
+                'candidate': 0,
+                'eligible': 0,
+                'published': 0,
+            })
+            row[stage_name] += 1
+    ranked = sorted(
+        rows.values(),
+        key=lambda row: (
+            -row['published'],
+            -row['eligible'],
+            -row['candidate'],
+            -row['relevant'],
+            -row['raw'],
+            row['source'],
+        ),
+    )
+    selected_sources = {row['source'] for row in ranked if row['published']}
+    volume_sources = {row['source'] for row in ranked[:max(0, int(limit))]}
+    keep_sources = selected_sources | volume_sources
+    focused = [row for row in ranked if row['source'] in keep_sources]
+    focused.sort(
+        key=lambda row: (
+            -row['published'],
+            -row['eligible'],
+            -row['candidate'],
+            -row['relevant'],
+            -row['raw'],
+            row['source'],
+        )
+    )
+    return focused[:max(0, int(limit))]
+
+
+def format_source_performance_rows(rows):
+    lines = []
+    for row in rows or []:
+        raw = int(row.get('raw', 0) or 0)
+        published = int(row.get('published', 0) or 0)
+        rate = (published / raw * 100) if raw else 0.0
+        source = clean_text(row.get('source', '')).split(':', 1)[-1]
+        lines.append(
+            '- ' + source
+            + ' | 原始 ' + str(raw)
+            + ' / 相关 ' + str(row.get('relevant', 0))
+            + ' / 候选 ' + str(row.get('candidate', 0))
+            + ' / 门禁 ' + str(row.get('eligible', 0))
+            + ' / 最终 ' + str(published)
+            + ' | 原始到最终 ' + f'{rate:.1f}%'
+        )
+    return lines
+
+
 def append_selection_funnel_to_health_log(
     all_items,
     relevant_items,
@@ -3837,6 +5287,33 @@ def append_selection_funnel_to_health_log(
     except Exception:
         pass
 
+
+def append_source_performance_to_health_log(
+    all_items,
+    relevant_items,
+    history_deduped_items,
+    public_eligible_items,
+    published_items,
+):
+    """Append source contribution metrics for maintenance decisions."""
+    try:
+        rows = source_performance_snapshot(
+            all_items,
+            relevant_items,
+            history_deduped_items,
+            public_eligible_items,
+            published_items,
+        )
+        if not rows:
+            return
+        lines = SOURCE_HEALTH_LOG.read_text(encoding='utf-8').splitlines() if SOURCE_HEALTH_LOG.exists() else []
+        lines.append('')
+        lines.append('来源绩效（按来源/文献身份去重；用于维护决策，不改变本轮筛选）：')
+        lines.extend(format_source_performance_rows(rows))
+        atomic_write_text(SOURCE_HEALTH_LOG, chr(10).join(lines) + chr(10))
+    except Exception:
+        pass
+
 def fetch_feed(url, source_name, warning_kind='RSS'):
     results = []
     try:
@@ -3856,16 +5333,20 @@ def fetch_feed(url, source_name, warning_kind='RSS'):
             publisher_text = ''
             publisher = ''
             neighbor_region = ''
-            if warning_kind == 'DEEP_DISCOVERY':
+            if warning_kind in {'DEEP_DISCOVERY', 'SINO_WATCH'}:
                 source_meta = e.get('source') or {}
                 publisher = clean_text(source_meta.get('title', ''))
                 publisher_home = clean_text(source_meta.get('href', ''))
                 publisher_text = publisher.lower()
                 item_text = (publisher + ' ' + title + ' ' + summary).lower()
-                if any(term in item_text for term in DEEP_DISCOVERY_EXCLUDED_LOWER):
-                    continue
-                if not any(term in publisher_text for term in DEEP_DISCOVERY_TRUSTED_LOWER):
-                    continue
+                if warning_kind == 'DEEP_DISCOVERY':
+                    if any(term in item_text for term in DEEP_DISCOVERY_EXCLUDED_LOWER):
+                        continue
+                    if not any(term in publisher_text for term in DEEP_DISCOVERY_TRUSTED_LOWER):
+                        continue
+                else:
+                    if not publisher or any(term in publisher_text for term in SINO_WATCH_EXCLUDED_PUBLISHER_LOWER):
+                        continue
                 if publisher:
                     item_source = source_name + '｜' + publisher
                 neighbor_region = neighboring_perspective_region(publisher_text)
@@ -3883,21 +5364,29 @@ def fetch_feed(url, source_name, warning_kind='RSS'):
                 'word_count': metadata.get('word_count', 0),
                 'source_type': (
                     'institution_publication'
-                    if warning_kind == 'DEEP_DISCOVERY' and neighbor_region
+                    if warning_kind in {'DEEP_DISCOVERY', 'SINO_WATCH'} and neighbor_region
                     else (
                         'top_tier_media_discovery'
-                        if warning_kind == 'DEEP_DISCOVERY'
+                        if warning_kind in {'DEEP_DISCOVERY', 'SINO_WATCH'}
                         and any(name in publisher_text for name in TOP_TIER_MEDIA_PUBLISHERS)
-                        else ('discovery' if warning_kind == 'DEEP_DISCOVERY' else 'feed')
+                        else ('sino_watch_discovery' if warning_kind == 'SINO_WATCH' else ('discovery' if warning_kind == 'DEEP_DISCOVERY' else 'feed'))
                     )
                 ),
                 'source_tier': (
                     neighbor_institution_tier(publisher_text)
-                    if warning_kind == 'DEEP_DISCOVERY' and neighbor_region
+                    if warning_kind in {'DEEP_DISCOVERY', 'SINO_WATCH'} and neighbor_region
                     else (
                         1 if warning_kind == 'DEEP_DISCOVERY'
                         and any(name in publisher_text for name in TOP_TIER_MEDIA_PUBLISHERS)
-                        else (2 if warning_kind == 'DEEP_DISCOVERY' else 3)
+                        else (
+                            1 if warning_kind == 'SINO_WATCH'
+                            and any(name in publisher_text for name in TOP_TIER_MEDIA_PUBLISHERS)
+                            else (
+                                2 if warning_kind == 'SINO_WATCH'
+                                and any(term in publisher_text for term in SINO_WATCH_TRUSTED_PUBLISHER_LOWER)
+                                else (2 if warning_kind == 'DEEP_DISCOVERY' else 3)
+                            )
+                        )
                     )
                 ),
                 'publisher': publisher,
@@ -3907,6 +5396,8 @@ def fetch_feed(url, source_name, warning_kind='RSS'):
                 'perspective_region': neighbor_region,
                 'id': e.get('id', link + title),
             })
+            if warning_kind == 'SINO_WATCH_LOCAL' or source_name in SINO_WATCH_LOCAL_SEARCH_META:
+                annotate_sino_watch_local_item(results[-1])
     except Exception as exc:
         record_source_warning(warning_kind, source_name, url, exc)
     return results
@@ -3915,6 +5406,8 @@ def fetch_article_metadata(link, response_fetcher=None):
     metadata = {
         'title': '', 'summary': '', 'body_summary': '', 'published': None,
         'content_type': '', 'word_count': 0, 'access_status': 'unknown',
+        'central_asia_fulltext_mentions': 0,
+        'summary_mismatch': False,
     }
     try:
         fetcher = response_fetcher or request_url
@@ -4016,16 +5509,30 @@ def fetch_article_metadata(link, response_fetcher=None):
                 ])
             )
         ]
+        if meta_summary:
+            meta_key = normalize_title_key(meta_summary)
+            for paragraph_index, paragraph in enumerate(paragraphs):
+                if normalize_title_key(paragraph) == meta_key:
+                    paragraphs = paragraphs[paragraph_index:]
+                    break
         body_summary = ' '.join(paragraphs[:2])
         body_text = ' '.join(paragraphs)
         extracted_text = clean_text(extract_main_text(resp.text, link))
         if len(extracted_text) >= max(600, len(body_text) + 120):
             body_text = extracted_text
-            body_summary = excerpt(extracted_text, 500)
-        metadata['body_summary'] = clean_text(body_summary)[:500]
+            extracted_summary = excerpt(extracted_text, 500)
+            structured_fields = re.findall(r'"[A-Za-z][^"\r\n]{0,40}"\s*:', extracted_summary)
+            if len(structured_fields) < 3:
+                body_summary = extracted_summary
+        body_summary = clean_text(body_summary)
+        if summary_context_mismatch(page_title, body_summary):
+            body_summary = ''
+            metadata['body_summary_mismatch'] = True
+        metadata['body_summary'] = body_summary[:500]
         summary = meta_summary
         # Prefer body excerpt when meta description is missing, too short, or off-topic site boilerplate.
         if body_summary:
+            meta_has_ca_anchor = any(term in summary.lower() for term in STRONG_CA_ANCHOR_LOWER)
             caption_like_summary = (
                 len(summary) < 220
                 and any(term in summary.lower() for term in [
@@ -4035,15 +5542,42 @@ def fetch_article_metadata(link, response_fetcher=None):
                     '©',
                 ])
             )
-            if not summary or len(summary) < 80 or caption_like_summary:
+            if not summary or (len(summary) < 80 and not meta_has_ca_anchor) or caption_like_summary:
                 summary = body_summary
             else:
                 title_tokens = set(re.findall(r'[a-zA-Z\u4e00-\u9fff]{4,}', (page_title or '').lower()))
                 summary_tokens = set(re.findall(r'[a-zA-Z\u4e00-\u9fff]{4,}', summary.lower()))
                 overlap = len(title_tokens & summary_tokens)
-                if title_tokens and overlap == 0:
+                generic_meta_terms = [
+                    'official website', 'latest news', 'read more', 'learn more',
+                    'homepage', 'welcome to', 'subscribe', 'sign up',
+                ]
+                if (
+                    any(term in summary.lower() for term in generic_meta_terms)
+                    or (
+                        len(summary) < 120
+                        and title_tokens
+                        and overlap == 0
+                        and len(body_summary) >= len(summary) + 120
+                        and not meta_has_ca_anchor
+                    )
+                ):
                     summary = body_summary
-        metadata['summary'] = clean_text(summary)[:500]
+        summary = clean_text(summary)
+        summary_mismatch = summary_context_mismatch(page_title, summary)
+        if summary_mismatch:
+            # Some institutional pages expose a stale or unrelated global
+            # meta-description. Never promote that text into the research
+            # record; a valid body excerpt may still be used below.
+            if body_summary and not summary_context_mismatch(page_title, body_summary):
+                summary = body_summary
+                summary_mismatch = False
+            else:
+                summary = ''
+        # The flag describes the final usable evidence, not an intermediate
+        # meta-description that was correctly discarded in favour of body text.
+        metadata['summary_mismatch'] = bool(summary_mismatch and not summary)
+        metadata['summary'] = summary[:500]
         if not date_value:
             date_patterns = [
                 r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b',
@@ -4058,6 +5592,12 @@ def fetch_article_metadata(link, response_fetcher=None):
         metadata['published'] = date_value
         metadata['content_type'] = ' | '.join(content_type_parts)[:240]
         metadata['word_count'] = len(re.findall(r'\b[\w-]+\b', body_text, re.UNICODE))
+        lowered_body = body_text.lower()
+        metadata['central_asia_fulltext_mentions'] = sum(
+            lowered_body.count(term)
+            for term in STRONG_CA_ANCHOR_LOWER
+            if len(term) >= 5
+        )
         if metadata['access_status'] == 'paywalled' and metadata['word_count'] >= 500:
             metadata['access_status'] = 'open'
     except Exception:
@@ -4067,12 +5607,24 @@ def fetch_article_metadata(link, response_fetcher=None):
 SOURCE_WEB_SELECTORS = {
     'CSIS Search Central Asia': ['a[href*="/analysis/"]'],
     'Ifri Central Asia': ['a[href*="/papers/"]'],
+    'Central Asia Program (Wilson Center)': [
+        'a[href*="/publication/"]', 'a[href*="/article/"]',
+    ],
+    'Eurasian Research Institute': ['a[href*="/publications/"]'],
 }
 
 SOURCE_WEB_REQUIRED_PATHS = {
     'CSIS Search Central Asia': ['/analysis/'],
     'Ifri Central Asia': ['/papers/'],
+    'Central Asia Program (Wilson Center)': ['/publication/', '/article/'],
+    'Eurasian Research Institute': ['/publications/'],
 }
+
+DEFAULT_WEB_SELECTORS = [
+    'article a', '.post a', '.entry a', '.views-row a', '.card a',
+    '.teaser a', '.news a', 'h1 a', 'h2 a', 'h3 a',
+    'a[href*="/news/"]', 'a[href*="/articles/"]', 'a[href*="/analysis/"]',
+]
 
 def fetch_web(source_name, url, warning_kind='WEB'):
     results = []
@@ -4080,11 +5632,7 @@ def fetch_web(source_name, url, warning_kind='WEB'):
         resp = request_url(url, timeout=12, retries=1)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'lxml')
-        selectors = SOURCE_WEB_SELECTORS.get(source_name, [
-            'article a', '.post a', '.entry a', '.views-row a', '.card a',
-            '.teaser a', '.news a', 'h1 a', 'h2 a', 'h3 a',
-            'a[href*="/news/"]', 'a[href*="/articles/"]', 'a[href*="/analysis/"]',
-        ])
+        selectors = SOURCE_WEB_SELECTORS.get(source_name, DEFAULT_WEB_SELECTORS)
         seen_links = set()
         for sel in selectors:
             for el in soup.select(sel)[:12]:
@@ -4125,6 +5673,7 @@ def fetch_web(source_name, url, warning_kind='WEB'):
                     source_name in (DEEP_ANALYSIS_SOURCES | set(PDF_REPORT_SOURCES) | set(MEETING_MINUTES_SOURCES))
                     or source_name in DURABLE_PRESTIGE_DISCOVERY_SOURCES
                     or needs_official_metadata
+                    or warning_kind == 'SINO_WATCH_LOCAL'
                 )
                 if metadata_source and (
                     not item_date or len(summary) < 120 or needs_prestige_metadata
@@ -4153,6 +5702,8 @@ def fetch_web(source_name, url, warning_kind='WEB'):
                     'source_tier': 1 if source_name in TIER_ONE_PRESTIGE_DISCOVERY_SOURCES else 2,
                     'id': source_name + ':' + href,
                 })
+                if warning_kind == 'SINO_WATCH_LOCAL':
+                    annotate_sino_watch_local_item(results[-1])
                 if len(results) >= 8:
                     break
             if len(results) >= 8:
@@ -4299,8 +5850,125 @@ OFFICIAL_ACTIVITY_TITLE_TERMS = [
     '代表团', '论坛', '会议', '祝贺',
 ]
 OFFICIAL_ACTIVITY_TITLE_LOWER = [term.lower() for term in OFFICIAL_ACTIVITY_TITLE_TERMS]
-def fetch_pdf_reports(source_name, url, warning_kind='PDF_REPORT'):
+
+SITEMAP_RESEARCH_URL_TERMS = [
+    'central-asia', 'central_asia', 'kazakhstan', 'uzbekistan', 'kyrgyzstan',
+    'tajikistan', 'turkmenistan', 'caspian', 'aral', 'fergana', 'eurasia',
+    'middle-corridor', 'middle_corridor', 'trans-caspian', 'transcaspian',
+    'c5-1', 'c5+1', 'silk-road', 'silk_road',
+]
+
+
+def sitemap_research_url_signal(url):
+    surface = urllib.parse.unquote(clean_text(url)).lower()
+    return any(term in surface for term in SITEMAP_RESEARCH_URL_TERMS)
+
+
+def sitemap_child_priority(url):
+    surface = clean_text(url).lower()
+    research_maps = [
+        'research', 'publication', 'report', 'analysis', 'article',
+        'post-type-post', 'insight', 'commentary', 'paper', 'policy',
+    ]
+    non_research_maps = [
+        'event', 'in-the-media', 'in_the_media', 'person', 'author', 'topic',
+        'tag', 'post_status', 'page-sitemap', 'post-type-page',
+    ]
+    parsed = urllib.parse.urlsplit(surface)
+    filename = parsed.path.rsplit('/', 1)[-1]
+    sequence_match = re.search(r'(\d+)(?=\.xml$)', filename)
+    if not sequence_match:
+        sequence_values = urllib.parse.parse_qs(parsed.query).get('page', [])
+        sequence_match = re.match(r'\d+$', sequence_values[0]) if sequence_values else None
+    sequence = int(sequence_match.group(0)) if sequence_match else -1
+    if any(term in surface for term in non_research_maps):
+        map_rank = 2
+    elif any(term in surface for term in research_maps):
+        map_rank = 0
+    else:
+        map_rank = 1
+    return (
+        map_rank,
+        0 if sequence < 0 else 1,
+        -sequence,
+        surface,
+    )
+
+
+def sitemap_visit_key(url):
+    """Preserve sitemap pagination queries such as sitemap.xml?page=9."""
+    parsed = urllib.parse.urlsplit(clean_text(url))
+    return urllib.parse.urlunsplit((
+        parsed.scheme.lower(),
+        parsed.netloc.lower(),
+        parsed.path,
+        parsed.query,
+        '',
+    ))
+
+
+def discover_sitemap_research_urls(sitemap_urls, allowed_paths=None, max_documents=18, max_candidates=60):
+    """Recursively turn institutional sitemap indexes into article candidates."""
+    allowed_paths = list(allowed_paths or [])
+    queue = [url for url in sitemap_urls or [] if url]
+    visited = set()
+    candidates = {}
+    while queue and len(visited) < max_documents:
+        sitemap_url = queue.pop(0)
+        normalized = sitemap_visit_key(sitemap_url)
+        if not normalized or normalized in visited:
+            continue
+        visited.add(normalized)
+        try:
+            response = request_url(sitemap_url, timeout=18, retries=1)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, features='xml')
+        except Exception:
+            continue
+        child_sitemaps = []
+        for node in soup.find_all(['sitemap', 'url']):
+            loc_node = node.find('loc')
+            if not loc_node:
+                continue
+            loc = clean_text(loc_node.get_text(' ', strip=True))
+            if not loc.startswith('http'):
+                continue
+            lastmod_node = node.find('lastmod')
+            lastmod = clean_text(lastmod_node.get_text(' ', strip=True)) if lastmod_node else ''
+            parsed = urllib.parse.urlparse(loc)
+            looks_like_sitemap = (
+                parsed.path.lower().endswith('.xml')
+                or 'sitemap' in parsed.path.lower()
+            )
+            if looks_like_sitemap:
+                if sitemap_visit_key(loc) not in visited and loc not in queue:
+                    child_sitemaps.append(loc)
+                continue
+            path = parsed.path.lower()
+            if allowed_paths and not any(term in path for term in allowed_paths):
+                continue
+            if not sitemap_research_url_signal(loc):
+                continue
+            candidates[normalize_history_link(loc)] = (loc, lastmod)
+        if child_sitemaps:
+            child_sitemaps.sort(key=sitemap_child_priority)
+            queue = child_sitemaps + queue
+    ranked = sorted(
+        candidates.values(),
+        key=lambda record: (parse_date_text(record[1]) or datetime.date.min, record[0]),
+        reverse=True,
+    )
+    return ranked[:max_candidates]
+
+
+def fetch_pdf_reports(source_name, url, warning_kind='PDF_REPORT', history_keys=None):
+    # Known bot-challenged archives are covered by targeted discovery queries.
+    # Do not hit them again from the report worker: repeated 403/404 noise hides
+    # the health of the direct publication adapters that remain usable.
+    if REPORT_SOURCE_ACCESS_MODE.get(source_name) == 'discovery-only':
+        return []
     results = []
+    history_keys = set(history_keys or [])
     try:
         seen_links = set()
         adapter = INSTITUTION_ADAPTER_CONFIG.get(source_name, {})
@@ -4311,24 +5979,83 @@ def fetch_pdf_reports(source_name, url, warning_kind='PDF_REPORT'):
         # Publication sitemaps often remain available when the visual archive
         # is JS-rendered or protected by a bot challenge. Treat them as a
         # discovery index, then verify each candidate through its landing page.
-        sitemap_candidates = []
-        for sitemap_url in adapter.get('sitemap_urls', []):
-            try:
-                sm_resp = request_url(sitemap_url, timeout=15, retries=0)
-                if sm_resp.status_code >= 400:
-                    continue
-                content_type = (sm_resp.headers.get('content-type', '') or '').lower()
-                if 'xml' not in content_type and '<urlset' not in sm_resp.text[:500].lower() and '<sitemapindex' not in sm_resp.text[:500].lower():
-                    continue
-                sm_soup = BeautifulSoup(sm_resp.text, features='xml')
-                for loc in sm_soup.select('url > loc, sitemap > loc')[:400]:
-                    candidate = clean_text(loc.get_text(' ', strip=True))
-                    if candidate.startswith('http'):
-                        sitemap_candidates.append(candidate)
-            except Exception:
+        sitemap_candidates = discover_sitemap_research_urls(
+            adapter.get('sitemap_urls', []),
+            allowed_paths=adapter_paths,
+            max_documents=int(adapter.get('sitemap_max_documents', 18) or 18),
+            max_candidates=int(adapter.get('sitemap_max_candidates', 60) or 60),
+        )
+        registry = institution_source_metadata(source_name)
+        archive_mode = source_name in INSTITUTION_SOURCE_REGISTRY or adapter.get('durable_archive')
+        for candidate_url, sitemap_lastmod in sitemap_candidates:
+            if len(results) >= 10:
+                break
+            metadata = fetch_article_metadata(candidate_url)
+            title = clean_web_title(metadata.get('title', ''))
+            summary = best_metadata_summary(metadata, prefer_body=True)
+            body_summary = clean_rss_summary_html(metadata.get('body_summary', ''))
+            if not title or len(title) < 10 or is_generic_title(title):
                 continue
-        if sitemap_candidates:
-            page_urls.extend(sitemap_candidates[:12])
+            surface = (title + ' ' + summary + ' ' + body_summary + ' ' + candidate_url).lower()
+            if adapter_excludes and any(term in surface for term in adapter_excludes):
+                continue
+            if not any(term in surface for term in STRONG_CA_ANCHOR_LOWER):
+                continue
+            title_link_surface = (title + ' ' + candidate_url).lower()
+            title_link_anchor = any(term in title_link_surface for term in STRONG_CA_ANCHOR_LOWER)
+            fulltext_mentions = int(metadata.get('central_asia_fulltext_mentions', 0) or 0)
+            if not title_link_anchor and fulltext_mentions < 2:
+                continue
+            candidate_summary = summary
+            summary_anchor_surface = (title + ' ' + summary + ' ' + candidate_url).lower()
+            if body_summary and summary and body_summary.lower().startswith(summary.lower()) and len(body_summary) >= len(summary) + 120:
+                candidate_summary = body_summary
+            elif (
+                body_summary
+                and not any(term in summary_anchor_surface for term in STRONG_CA_ANCHOR_LOWER)
+            ):
+                # Put the body excerpt first so the Central Asia evidence is not
+                # truncated behind a generic meta description.
+                candidate_summary = clean_text(body_summary + ' ' + summary)
+            metadata_date = metadata.get('published')
+            sitemap_date = parse_date_text(sitemap_lastmod)
+            url_year = publication_year_from_url(candidate_url)
+            year_only = bool(not metadata_date and url_year)
+            item_date = metadata_date or (datetime.date(url_year, 1, 1) if year_only else sitemap_date)
+            if not item_date:
+                continue
+            age_days = (TODAY - item_date).days
+            max_age = DURABLE_RESEARCH_MAX_AGE_DAYS if archive_mode else MAX_SLOW_PUBLICATION_AGE_DAYS
+            if age_days < -1 or age_days > max_age:
+                continue
+            candidate_item = {
+                'source': source_name,
+                'title': title[:180],
+                'link': candidate_url,
+                'summary': candidate_summary[:500],
+                'published': '' if year_only else item_date.isoformat(),
+                'publication_year': url_year if year_only else item_date.year,
+                'date_precision': 'year' if year_only else 'day',
+                'content_type': metadata.get('content_type', ''),
+                'word_count': metadata.get('word_count', 0),
+                'central_asia_fulltext_mentions': fulltext_mentions,
+                'access_status': metadata.get('access_status', 'unknown'),
+                'source_type': 'institution_publication',
+                'institution': registry['institution'],
+                'institution_publication_kind': registry['kind'],
+                'source_tier': registry['tier'],
+                'id': source_name + ':' + candidate_url,
+            }
+            if history_keys and item_history_keys(candidate_item) & history_keys:
+                continue
+            refresh_item_evidence(candidate_item)
+            if not is_research_grade_public_item(candidate_item):
+                continue
+            normalized_candidate = normalize_history_link(candidate_url)
+            if normalized_candidate in seen_links:
+                continue
+            seen_links.add(normalized_candidate)
+            results.append(candidate_item)
         visited_pages = set()
         exclude_path_terms = [
             'event', 'events', 'agenda', 'calendar', 'webinar', 'newsletter',
@@ -4339,8 +6066,7 @@ def fetch_pdf_reports(source_name, url, warning_kind='PDF_REPORT'):
         required_path_terms = {
             'Ifri Papers Central Asia': ['/papers/'],
         }.get(source_name, [])
-        archive_mode = source_name in INSTITUTION_SOURCE_REGISTRY or adapter.get('durable_archive')
-        max_pages = (6 if archive_mode else 3) + min(12, len(sitemap_candidates))
+        max_pages = 6 if archive_mode else 3
         while page_urls and len(visited_pages) < max_pages and len(results) < 10:
             page_url = page_urls.pop(0)
             normalized_page = normalize_history_link(page_url)
@@ -4404,7 +6130,7 @@ def fetch_pdf_reports(source_name, url, warning_kind='PDF_REPORT'):
                     source_name in INSTITUTION_SOURCE_REGISTRY
                     and len(title) >= 20
                     and not is_generic_title(title)
-                    and any(path in path for path in [
+                    and any(allowed_path in path for allowed_path in [
                         '/article', '/articles/', '/analysis/', '/research/', '/publication',
                         '/policy-', '/policy_memo', '/policy-memos/', '/insights/', '/politika/',
                     ])
@@ -4458,13 +6184,13 @@ def fetch_pdf_reports(source_name, url, warning_kind='PDF_REPORT'):
                 seen_links.add(normalized)
                 # Do not put source names containing "Central Asia" into summary,
                 # or has_strong_central_asia_anchor will false-positive later.
-                snippet = trim_text(context_text, 280) if context_text else ''
-                if metadata.get('summary') and len(metadata['summary']) > len(snippet):
-                    snippet = metadata['summary']
+                snippet = best_metadata_summary(metadata, prefer_body=True)
+                if not snippet and context_text:
+                    snippet = trim_text(context_text, 280)
                 if not snippet or len(snippet) < 40:
                     snippet = 'Institutional report/publication candidate with identifiable date.'
                 registry = institution_source_metadata(source_name)
-                results.append({
+                candidate_item = {
                     'source': source_name,
                     'title': title[:180],
                     'link': link,
@@ -4479,7 +6205,13 @@ def fetch_pdf_reports(source_name, url, warning_kind='PDF_REPORT'):
                     'source_tier': registry['tier'],
                     'access_status': metadata.get('access_status', 'unknown'),
                     'id': source_name + ':' + link,
-                })
+                }
+                # Archive pages commonly expose the same newest records every day.
+                # Skip prior recommendations before applying the per-source cap so
+                # pagination can continue into older, still-unread research.
+                if history_keys and item_history_keys(candidate_item) & history_keys:
+                    continue
+                results.append(candidate_item)
                 if len(results) >= 10:
                     break
     except Exception as exc:
@@ -4856,7 +6588,7 @@ def _academic_item_from_crossref(work, source_name='Academic: Crossref'):
         'id': source_name + ':' + doi,
     }
 
-def _academic_item_from_openalex(work, source_name='Academic: OpenAlex'):
+def _academic_item_from_openalex(work, source_name='Academic: OpenAlex', durable_backfill=False):
     title = clean_text(work.get('display_name', ''))
     doi_url = clean_text(work.get('doi', ''))
     doi = doi_url.replace('https://doi.org/', '').replace('http://doi.org/', '')
@@ -4889,6 +6621,7 @@ def _academic_item_from_openalex(work, source_name='Academic: OpenAlex'):
         'academic_venue': venue,
         'academic_authors': authors,
         'cited_by_count': int(work.get('cited_by_count') or 0),
+        'durable_backfill': bool(durable_backfill),
         'id': source_name + ':' + (doi or clean_text(work.get('id', ''))),
     }
 
@@ -5001,11 +6734,12 @@ def fetch_openalex(query, warning_kind='ACADEMIC'):
         record_source_warning(warning_kind, source_name, query, exc)
     return results
 
-def fetch_durable_openalex_backfill(warning_kind='ACADEMIC_BACKFILL'):
+def fetch_durable_openalex_backfill(history_keys=None, warning_kind='ACADEMIC_BACKFILL'):
     """Find durable, unread scholarship only after a zero-result daily pass."""
     source_name = 'Academic: OpenAlex'
     results = []
     seen = set()
+    history_keys = set(history_keys or [])
     try:
         from_date = TODAY - datetime.timedelta(days=DURABLE_ACADEMIC_BACKFILL_DAYS)
         until_date = TODAY - datetime.timedelta(days=ACADEMIC_LOOKBACK_DAYS + 1)
@@ -5030,8 +6764,14 @@ def fetch_durable_openalex_backfill(warning_kind='ACADEMIC_BACKFILL'):
             url = academic_api_url('https://api.openalex.org/works', params, 'openalex')
             resp = request_academic_api(url, 'openalex', timeout=20)
             for work in resp.json().get('results', []):
-                item = _academic_item_from_openalex(work, source_name=source_name)
+                item = _academic_item_from_openalex(
+                    work,
+                    source_name=source_name,
+                    durable_backfill=True,
+                )
                 if not item:
+                    continue
+                if history_keys and item_history_keys(item) & history_keys:
                     continue
                 key = item.get('id') or item.get('link')
                 if key in seen:
@@ -5361,8 +7101,7 @@ PUBLICATION_RISK_SOURCES = {
 
 PUBLIC_LOW_VALUE_TERMS = [
     'weather', 'forecast', 'weekend', 'rain', 'snow',
-    'dollar traded', 'exchange rate', 'stock exchange',
-    'average prices', 'tomatoes', 'cucumbers',
+    'dollar traded', 'tomatoes', 'cucumbers',
     'concert', 'birthday', 'anniversary celebration',
     # thin transport / personnel / deal blurbs never belong in public deep digest
     'direct flight', 'launch direct flight', 'launches flight', 'airline',
@@ -5374,7 +7113,7 @@ PUBLIC_LOW_VALUE_TERMS = [
     '航班', '直飞', '通航', '航线', '任命', '出任', '州长',
     'egypt', 'byzantine', 'grocery delivery', 'delivery service',
     'grandmother', 'chose to fly', 'comic-con', 'comic con',
-    'netflix', 'one piece', 'actor', 'actress', 'anime',
+    'netflix', 'one piece', 'actress', 'anime',
     'akhal-teke', 'filly', 'horse', 'opera legend',
     '100 years of opera', 'new book', 'ten words one journey',
     'weekly media highlights', 'headlines from the caspian',
@@ -5401,6 +7140,73 @@ PUBLIC_LOW_VALUE_TERMS = [
     'огурц', 'египт', 'византий', 'доставк', 'бабушк',
 ]
 PUBLIC_LOW_VALUE_LOWER = [term.lower() for term in PUBLIC_LOW_VALUE_TERMS]
+
+TRANSPORT_SAFETY_NEWS_TITLE_TERMS = [
+    'aviation incident investigation', 'aviation safety', 'flight safety',
+    'transport accident investigation', 'air accident investigation',
+    '航空事故调查', '航空安全', '运输事故调查',
+]
+TRANSPORT_SAFETY_NEWS_TITLE_LOWER = [term.lower() for term in TRANSPORT_SAFETY_NEWS_TITLE_TERMS]
+
+NON_RESEARCH_FEATURE_TITLE_TERMS = [
+    'photographing', 'photographer', 'photography', 'photo essay',
+    'visual essay', 'photo exhibition', 'gallery exhibition',
+    'relevant past policy memos', 'relevant past ponars eurasia policy memos',
+    '摄影', '摄影师', '摄影展', '照片随笔', '视觉随笔',
+]
+NON_RESEARCH_FEATURE_TITLE_LOWER = [term.lower() for term in NON_RESEARCH_FEATURE_TITLE_TERMS]
+NON_RESEARCH_FEATURE_URL_TERMS = [
+    '/gallery/', '/galleries/', '/photo-essay', '/photo_essay',
+    '/album/', '/albums/', '/photos/',
+]
+NON_RESEARCH_PROJECT_TITLE_TERMS = [
+    'launches long-term monitoring', 'launch long-term monitoring',
+    'launches a monitoring project', 'launch a monitoring project',
+    'launches monitoring project', 'launch monitoring project',
+    'research project launched', 'research project begins',
+    'project launched', 'project begins', 'project kicks off',
+    '启动长期监测', '启动监测项目', '研究项目启动', '项目启动',
+    '开始长期监测', '开展监测项目',
+]
+
+NON_RESEARCH_NOTICE_TITLE_TERMS = [
+    'vacancy', 'vacant position', 'job opening', 'job vacancy', 'job vacancies',
+    'recruitment', 'recruiting', 'apply for the position',
+    'competition for the vacant', 'head of the department',
+    'call for applications', '招聘', '招聘公告', '空缺职位', '竞聘',
+    '申请职位', 'вакансия', 'вакансии', 'конкурс на замещение вакантной должности',
+]
+NON_RESEARCH_NOTICE_URL_TERMS = [
+    '/vacan', '/job', '/career', '/careers', '/recruit', '/employment',
+]
+NON_RESEARCH_NOTICE_TITLE_LOWER = [term.lower() for term in NON_RESEARCH_NOTICE_TITLE_TERMS]
+
+def is_non_research_notice(item):
+    title = item_title_text(item)
+    link = clean_text(item.get('link', '')).lower()
+    if any(term in title for term in NON_RESEARCH_NOTICE_TITLE_LOWER):
+        return True
+    return any(term in link for term in NON_RESEARCH_NOTICE_URL_TERMS)
+
+def is_transport_safety_news(item):
+    title = item_title_text(item)
+    if not any(term in title for term in TRANSPORT_SAFETY_NEWS_TITLE_LOWER):
+        return False
+    return not is_report_grade_item(item)
+
+def is_non_research_feature(item):
+    title = item_title_text(item)
+    link_path = urllib.parse.urlparse(item.get('link', '') or '').path.lower()
+    if any(term in link_path for term in NON_RESEARCH_FEATURE_URL_TERMS):
+        return True
+    if (
+        any(term in title for term in NON_RESEARCH_PROJECT_TITLE_TERMS)
+        and not any(term in title for term in STRICT_DEEP_FORMAT_LOWER)
+    ):
+        return True
+    if not any(term in title for term in NON_RESEARCH_FEATURE_TITLE_LOWER):
+        return False
+    return not any(term in title for term in STRICT_DEEP_FORMAT_LOWER)
 
 # Admissions, degree and course-promotion pages are useful as source
 # discovery signals but are not research outputs for the public digest.
@@ -5579,6 +7385,12 @@ def is_durable_research_grade(item):
     word_count = int(item.get('word_count', 0) or 0)
     return len(summary) >= 120 or word_count >= 500
 
+
+def is_long_term_research_item(item):
+    """Return True for material outside the daily 30-day publication window."""
+    age_days = item_age_days(item)
+    return age_days is not None and age_days > MAX_SLOW_PUBLICATION_AGE_DAYS
+
 def is_recent_item(item):
     source = item.get('source', '')
     age_days = item_age_days(item)
@@ -5590,10 +7402,14 @@ def is_recent_item(item):
         # Daily academic discovery stays recent, but on an otherwise empty day
         # a previously unseen, peer-reviewed article may enter through the
         # durable backfill path below.
-        max_age = DURABLE_ACADEMIC_BACKFILL_DAYS
+        max_age = (
+            DURABLE_ACADEMIC_BACKFILL_DAYS
+            if item.get('durable_backfill')
+            else ACADEMIC_LOOKBACK_DAYS
+        )
     elif source in DURABLE_PRESTIGE_DISCOVERY_SOURCES or item.get('source_type') == 'institution_publication':
-        # Major think-tank and university archives supply unread, durable
-        # research rather than only the last month of web updates.
+        # Institutional archives are discovery surfaces, but the daily edition
+        # still limits their materials to the current 30-day research window.
         max_age = DURABLE_RESEARCH_MAX_AGE_DAYS
     elif source in (set(PDF_REPORT_SOURCES) | REPORT_API_SOURCE_NAMES):
         # Institutional reports remain useful beyond the daily news cycle;
@@ -5637,6 +7453,14 @@ STRONG_CA_ANCHOR_TERMS = [
     '中间走廊', '跨里海',
     'казахстан', 'узбекистан', 'кыргызстан', 'киргизия', 'таджикистан', 'туркменистан',
     'средний коридор', 'транскаспий',
+    'қазақстан', 'өзбекстан', 'қырғызстан', 'тәжікстан', 'түрікменстан',
+    'астана', 'алматы', 'ташкент', 'бішкек', 'душанбе', 'ашхабад',
+    'qozogʻiston', "qozog'iston", 'qozogiston', 'oʻzbekiston', "o'zbekiston", 'ozbekiston',
+    'qirgʻiziston', "qirg'iziston", 'qirgiziston', 'tojikiston', 'turkmaniston',
+    'toshkent', 'bishkek', 'dushanbe', 'ashxobod',
+    'Казакстан', 'Кыргызстан', 'Тажикстан', 'Түркмөнстан', 'Бишкек', 'Ош',
+    'Қазоқистон', 'Ӯзбекистон', 'Қирғизистон', 'Тоҷикистон', 'Туркманистон',
+    'Gazagystan', 'Özbegistan', 'Gyrgyzystan', 'Täjigistan', 'Aşgabat',
 ]
 STRONG_CA_ANCHOR_LOWER = [term.lower() for term in STRONG_CA_ANCHOR_TERMS]
 
@@ -5652,6 +7476,14 @@ def has_strong_central_asia_anchor(item):
         '中间走廊', '跨里海',
         'казахстан', 'узбекистан', 'кыргызстан', 'киргизия', 'таджикистан', 'туркменистан',
         'средний коридор', 'транскаспий',
+        'қазақстан', 'өзбекстан', 'қырғызстан', 'тәжікстан', 'түрікменстан',
+        'астана', 'алматы', 'ташкент', 'бішкек', 'душанбе', 'ашхабад',
+        'qozogʻiston', "qozog'iston", 'qozogiston', 'oʻzbekiston', "o'zbekiston", 'ozbekiston',
+        'qirgʻiziston', "qirg'iziston", 'qirgiziston', 'tojikiston', 'turkmaniston',
+        'toshkent', 'bishkek', 'dushanbe', 'ashxobod',
+        'Казакстан', 'Кыргызстан', 'Тажикстан', 'Түркмөнстан', 'Бишкек', 'Ош',
+        'Қазоқистон', 'Ӯзбекистон', 'Қирғизистон', 'Тоҷикистон', 'Туркманистон',
+        'Gazagystan', 'Özbegistan', 'Gyrgyzystan', 'Täjigistan', 'Aşgabat',
     ]
     has_substance = any(term in text for term in ca_substance_terms)
     has_generic = 'central asia' in text or '中亚' in text
@@ -5865,6 +7697,10 @@ def is_publication_risky(item):
 
 def is_public_low_value(item):
     text = item_content_text(item)
+    if is_non_research_notice(item):
+        return True
+    if is_non_research_feature(item):
+        return True
     if is_generic_item(item):
         return True
     if is_education_promotion(item):
@@ -5903,6 +7739,8 @@ def is_event_preview_or_diplomatic_blurb(item):
         r'\b(congress|conference|summit|forum|exhibition|expo|roundtable)\b.*\b(to |will |highlights?|to be held|opens?|opening|set to)\b',
         r'\b(to highlight|will highlight|set to host|to be held|will host|to convene)\b',
         r'\b(mining congress|metallurgy congress|amm 20\d{2}|business forum)\b',
+        r'\b(leaders?|presidents?|prime ministers?|ministers?)\b.*\b(to attend|attend|attending|participate|take part)\b.*\b(summit|conference|forum)\b',
+        r'\b(to attend|attend|attending)\b.*\b(summit|conference|forum)\b',
         r'大会|展览会|论坛将|将于.*举行|将强调|开幕在即',
     ]
     diplomatic_patterns = [
@@ -5931,6 +7769,8 @@ def is_public_simple_news(item):
         return True
     # Event previews / diplomatic statements never fill public, even from specialist outlets.
     if is_event_preview_or_diplomatic_blurb(item):
+        return True
+    if is_transport_safety_news(item):
         return True
     # Specialist CA research outlets: substantive pieces are not simple news.
     if specialist_relaxed_longform_ok(item):
@@ -6141,6 +7981,23 @@ def published_ordinal(item):
     return year * 366 if year else 0
 
 
+def research_freshness_bucket(item):
+    """Prefer recent qualified research without excluding durable older work."""
+    date_value = parse_item_published_date(item)
+    if not date_value:
+        return 0
+    age_days = (TODAY - date_value).days
+    if age_days < 0:
+        return 0
+    if age_days <= 30:
+        return 4
+    if age_days <= 365:
+        return 3
+    if age_days <= 3 * 365:
+        return 2
+    return 1
+
+
 def same_run_variant_score(item):
     """Prefer the richest copy when the same article arrives through several paths."""
     summary_len = len(clean_text(item.get('summary', '')))
@@ -6304,6 +8161,17 @@ def is_thin_analytical_news(item):
             return True
     return False
 
+def has_original_depth_evidence(item):
+    """Require substantive page evidence before treating a discovery as research."""
+    source = item.get('source', '')
+    summary_len = len(clean_text(item.get('summary', '')))
+    word_count = int(item.get('word_count', 0) or 0)
+    if source in ACADEMIC_SOURCE_NAMES or item.get('source_type') == 'academic_paper':
+        return summary_len >= 120 or word_count >= 500
+    if source in (set(PDF_REPORT_SOURCES) | REPORT_API_SOURCE_NAMES | set(MEETING_MINUTES_SOURCES)):
+        return summary_len >= 120 or word_count >= 500
+    return summary_len >= 160 or word_count >= 500
+
 def is_event_or_conference_announcement(item):
     """Block pure conference/event notices from public deep-read slots."""
     title = item_title_text(item)
@@ -6422,13 +8290,65 @@ def specialist_relaxed_longform_ok(item):
         + item.get('depth_term_score', 0)
         + item.get('policy_data_score', 0)
     )
-    if word_count >= 700 and item.get('core_score', 0) >= 1:
+    title = item_title_text(item)
+    has_explicit_format = any(term in title for term in STRICT_DEEP_FORMAT_LOWER)
+    explanatory_title = bool(re.search(
+        r'\b(why|how|what .* means|implications?|limits of|behind|vulnerability|fallout)\b',
+        title,
+        flags=re.I,
+    )) or '?' in title
+    if has_explicit_format and (summary_len >= 120 or word_count >= 500):
         return True
-    if summary_len >= 160 and item.get('core_score', 0) >= 1 and signal >= 1:
+    if (
+        item.get('depth_term_score', 0) >= 1
+        and item.get('research_score', 0) >= 1
+        and summary_len >= 160
+    ):
         return True
-    if summary_len >= 200 and item.get('core_score', 0) >= 1:
+    if (
+        item.get('policy_data_score', 0) >= 2
+        and item.get('research_score', 0) >= 1
+        and summary_len >= 160
+    ):
+        return True
+    if explanatory_title and item.get('research_score', 0) >= 1 and summary_len >= 180:
+        return True
+    if word_count >= 1000 and summary_len >= 220 and item.get('research_score', 0) >= 2:
         return True
     return False
+
+def is_specialist_article_without_research_frame(item):
+    if not is_specialist_relaxed_format_item(item):
+        return False
+    if is_report_grade_item(item):
+        return False
+    title = item_title_text(item)
+    summary_len = len(clean_text(item.get('summary', '')))
+    word_count = int(item.get('word_count', 0) or 0)
+    if any(term in title for term in STRICT_DEEP_FORMAT_LOWER):
+        return False
+    explanatory_title = bool(re.search(
+        r'\b(why|how|what .* means|implications?|limits of|behind|vulnerability|fallout)\b',
+        title,
+        flags=re.I,
+    )) or '?' in title
+    if (
+        item.get('depth_term_score', 0) >= 1
+        and item.get('research_score', 0) >= 1
+        and summary_len >= 160
+    ):
+        return False
+    if (
+        item.get('policy_data_score', 0) >= 2
+        and item.get('research_score', 0) >= 1
+        and summary_len >= 160
+    ):
+        return False
+    if explanatory_title and item.get('research_score', 0) >= 1 and summary_len >= 180:
+        return False
+    if word_count >= 1000 and summary_len >= 220 and item.get('research_score', 0) >= 2:
+        return False
+    return True
 
 def is_strict_deep_public_item(item):
     source = item.get('source', '')
@@ -6447,6 +8367,8 @@ def is_strict_deep_public_item(item):
     if is_event_or_conference_announcement(item):
         return False
     if is_thin_analytical_news(item):
+        return False
+    if is_specialist_article_without_research_frame(item):
         return False
     if is_country_assessment_item(item) and item.get('source_type') == 'institution_publication':
         return (
@@ -6731,9 +8653,13 @@ def is_deep_item(item):
 def is_research_grade_public_item(item):
     if not is_recent_item(item) or not has_verifiable_publication_time(item):
         return False
+    if item.get('summary_mismatch') and not clean_text(item.get('summary', '')):
+        return False
     if is_news_aggregation_item(item) or is_public_low_value(item) or is_public_simple_news(item):
         return False
     if is_thin_analytical_news(item) or is_institute_soft_content(item):
+        return False
+    if not has_original_depth_evidence(item):
         return False
     source = item.get('source', '')
     if source in BROAD_REGIONAL_DEEP_SOURCES and not has_strong_central_asia_anchor(item):
@@ -6938,6 +8864,12 @@ def refresh_item_evidence(item):
     Keeping this in one place prevents the pre-gate and final gate from using
     different score formulas after a Google News link has been resolved.
     """
+    # Older daily caches may retain a mismatch flag even after a valid body
+    # summary was recovered. Clear only those stale flags; a genuinely
+    # mismatched non-empty summary remains visible to the public gate.
+    if item.get('summary_mismatch') and clean_text(item.get('summary', '')):
+        if not summary_context_mismatch(item.get('title', ''), item.get('summary', '')):
+            item['summary_mismatch'] = False
     content = item_content_text(item)
     core_score = count_terms(content, CORE_CA_LOWER)
     research_score = count_terms(content, RESEARCH_LOWER)
@@ -7015,6 +8947,881 @@ def filter_items(items):
         elif passes_relevance and neg_count > 0:
             neg_tagged.append(item)
     return filtered, neg_tagged
+
+
+SINO_WATCH_CHINA_TERMS = [
+    'china', 'chinese', 'chinese company', 'chinese companies', 'chinese workers',
+    'chinese investment', 'chinese project', 'beijing', 'xinjiang', 'belt and road',
+    '中国', '中资', '中国企业', '中国工人', '中国投资', '中国项目', '北京', '新疆', '一带一路',
+    'китай', 'китайск', 'китайская компания', 'китайские компании', 'китайские рабочие',
+    'китайские инвестиции', 'синьцзян', 'пояс и путь',
+    'çin', 'çinli', 'çin şirket', 'çin yatır', 'sincan',
+    'қытай', 'қытайлық', 'қытай компаниясы', 'қытай инвестициясы', 'қытай жобасы',
+    'қытай жұмысшылары', 'бэйжің', 'шыңжаң', 'бір белдеу',
+    'xitoy', 'xitoylik', 'xitoy kompaniyasi', 'xitoy investitsiyasi', 'xitoy loyihasi',
+    'xitoy ishchilari', 'pekin', 'shinjon', 'bir makon',
+    'Кытай', 'кытайлык', 'кытай компаниясы', 'кытай инвестициясы', 'кытай долбоору',
+    'кытай жумушчулары', 'Бээжин', 'Шинжаң', 'бир алкак',
+    'Чин', 'чинӣ', 'ширкати чинӣ', 'сармоягузории Чин', 'лоиҳаи чинӣ',
+    'коргарони чинӣ', 'Пекин', 'Синзян', 'як камарбанд',
+    'Hytaý', 'hytaýly', 'Hytaý kompaniýasy', 'Hytaý maýa goýumlary', 'Hytaý taslamasy',
+    'Hytaý işçileri', 'Pekin', 'Şyngjan', 'bir guşak',
+]
+SINO_WATCH_CHINA_LOWER = [term.lower() for term in SINO_WATCH_CHINA_TERMS]
+SINO_WATCH_CHINA_EXACT_TERMS = {'чин'}
+
+SINO_WATCH_DISPUTE_TERMS = [
+    'protest', 'protests', 'protested', 'opposition', 'backlash', 'controversy',
+    'dispute', 'conflict', 'criticism', 'criticized', 'allegation', 'allegations',
+    'investigation', 'lawsuit', 'court', 'corruption', 'fraud', 'pollution',
+    'contamination', 'environmental damage', 'land grab', 'displacement',
+    'labor dispute', 'labour dispute', 'wage dispute', 'surveillance', 'boycott',
+    'resentment', 'anti-china', 'anti chinese', 'rights violation', 'abuse',
+    'sanctions', 'accident', 'safety violation', 'opaque contract', 'debt burden',
+    '抗议', '反对', '争议', '冲突', '批评', '指控', '调查', '诉讼', '法院', '腐败',
+    '欺诈', '污染', '环境破坏', '征地', '搬迁', '劳资纠纷', '监控', '抵制',
+    '不满', '反华', '权利侵犯', '虐待', '制裁', '事故', '安全事故', '合同不透明', '债务负担',
+    'протест', 'оппозици', 'скандал', 'спор', 'конфликт', 'критик', 'обвинен',
+    'расследован', 'суд', 'коррупц', 'мошеннич', 'загрязнен', 'эколог', 'земл',
+    'переселен', 'трудов', 'слежк', 'бойкот', 'недовольств', 'нарушен прав',
+    'санкц', 'авари', 'долгов',
+    'protesto', 'muhalefet', 'tepki', 'tartışma', 'anlaşmazlık', 'eleştiri',
+    'iddia', 'soruşturma', 'dava', 'yolsuzluk', 'kirlilik', 'çevre', 'toprak',
+    'işçi', 'gözetim', 'boykot', 'borç', 'uyuşmazlık',
+    'наразылық', 'қарсылық', 'дау', 'жанжал', 'сын', 'айыптау', 'тергеу', 'сот',
+    'жемқорлық', 'ластану', 'экология', 'жер', 'қоныс аудару', 'еңбек дауы',
+    'бақылау', 'бойкот', 'келісімшарт',
+    'norozilik', 'qarshilik', 'mojaro', 'janjal', 'tanqid', 'ayblov', 'tergov', 'sud',
+    'korrupsiya', 'ifloslanish', 'ekologiya', 'yer', 'koʻchirish', "ko'chirish",
+    'mehnat nizosi', 'kuzatuv', 'boykot',
+    'нааразычылык', 'каршылык', 'талаш', 'чыр', 'сын', 'айып', 'иликтөө', 'сот',
+    'коррупция', 'булгануу', 'экология', 'жер', 'көчүрүү', 'эмгек талашы',
+    'көзөмөл', 'бойкот',
+    'эътироз', 'мухолифат', 'баҳс', 'низо', 'танқид', 'айбдор', 'тафтиш', 'додгоҳ',
+    'фасод', 'ифлосшавӣ', 'муҳити зист', 'замин', 'кӯчонидан', 'ихтилофи меҳнатӣ',
+    'назорат', 'бойкот',
+    'nägilelik', 'garşylyk', 'jedel', 'dawa', 'tankyt', 'aýyplama', 'derňew', 'kazyýet',
+    'korrupsiýa', 'hapalanma', 'ekologiýa', 'ýer', 'göçürmek', 'zähmet dawasy',
+    'gözegçilik', 'boýkot',
+]
+SINO_WATCH_DISPUTE_LOWER = [term.lower() for term in SINO_WATCH_DISPUTE_TERMS]
+
+SINO_WATCH_NEGATIVE_TERMS = [
+    'protest', 'backlash', 'controversy', 'dispute', 'conflict', 'criticism',
+    'criticized', 'allegation', 'investigation', 'lawsuit', 'corruption',
+    'fraud', 'pollution', 'contamination', 'environmental damage', 'land grab',
+    'displacement', 'labor dispute', 'labour dispute', 'surveillance', 'boycott',
+    'resentment', 'anti-china', 'anti chinese', 'rights violation', 'abuse',
+    'sanctions', 'safety violation', 'opaque contract', 'debt burden',
+    'forced labor', 'forced labour', 'exploitation', 'repression', 'detention',
+    'harassment', 'discrimination', 'xenophobia',
+    '抗议', '反对', '争议', '冲突', '批评', '指控', '调查', '诉讼', '腐败',
+    '欺诈', '污染', '环境破坏', '征地', '搬迁', '劳资纠纷', '监控', '抵制',
+    '不满', '反华', '权利侵犯', '虐待', '制裁', '事故', '安全事故', '合同不透明',
+    '债务负担', '强迫劳动', '剥削', '镇压', '拘留', '歧视',
+    'протест', 'скандал', 'спор', 'конфликт', 'критик', 'обвинен',
+    'расследован', 'коррупц', 'мошеннич', 'загрязнен', 'переселен',
+    'трудов', 'слежк', 'бойкот', 'недовольств', 'нарушен прав', 'санкц',
+    'авари', 'долгов', 'эксплуатац', 'репресс', 'задержан', 'притеснен',
+    'дискримин',
+    'наразылық', 'қарсылық', 'дау', 'жанжал', 'сын', 'айыптау', 'тергеу',
+    'жемқорлық', 'ластану', 'қоныс аудару', 'еңбек дауы', 'бақылау', 'бойкот',
+    'нааразычылык', 'каршылык', 'талаш', 'чыр', 'айып', 'иликтөө',
+    'коррупция', 'булгануу', 'көчүрүү', 'эмгек талашы', 'көзөмөл',
+    'norozilik', 'qarshilik', 'mojaro', 'janjal', 'tanqid', 'ayblov', 'tergov',
+    'korrupsi', 'ifloslanish', "ko'chirish", 'mehnat nizosi', 'kuzatuv',
+    'эътироз', 'мухолифат', 'баҳс', 'низо', 'танқид', 'айбдор', 'тафтиш',
+    'фасод', 'ифлосшавӣ', 'кӯчонидан', 'ихтилофи меҳнатӣ', 'назорат',
+    'nägilelik', 'garşylyk', 'jedel', 'dawa', 'tankyt', 'aýyplama', 'derňew',
+    'korrupsiýa', 'hapalanma', 'göçürmek', 'zähmet dawasy', 'gözegçilik',
+]
+SINO_WATCH_NEGATIVE_LOWER = [term.lower() for term in SINO_WATCH_NEGATIVE_TERMS]
+SINO_WATCH_NEGATIVE_EXACT_TERMS = {
+    'сын', 'дау', 'чыр', 'айып', 'сот', 'суд', 'спор',
+}
+
+SINO_WATCH_POSITIVE_ONLY_TERMS = [
+    'cooperation', 'cooperate', 'partnership', 'strengthen ties', 'closer ties',
+    'delegation', 'representatives', 'meeting', 'met with', 'visit', 'visited',
+    'signed protocol', 'signed agreement', 'export', 'trade', 'investment',
+    '合作', '加强合作', '伙伴关系', '代表团', '会见', '访问', '签署协议', '出口',
+    'инвестици', 'сотруднич', 'партнерств', 'делегац', 'встретил', 'визит',
+    'экспорт', 'торгов',
+    'ынтымакташтык', 'кызматташтык', 'бекемдейт', 'делегация', 'жолугушту',
+    'экспорттой алат', 'соода', 'инвестиция',
+    'ҳамкорлик', 'делегация', 'учрашув', 'экспорт', 'савдо', 'инвестиция',
+    'ҳамкорӣ', 'намояндагон', 'мулоқот', 'содирот', 'сармоягузорӣ',
+    'Hytaý bilen hyzmatdaşlyk', 'hyzmatdaşlyk', 'wekiliýet', 'duşuşyk', 'eksport',
+]
+SINO_WATCH_POSITIVE_ONLY_LOWER = [term.lower() for term in SINO_WATCH_POSITIVE_ONLY_TERMS]
+
+def sino_watch_term_spans(text, term, exact_unicode=False):
+    if re.fullmatch(r'[a-z0-9][a-z0-9 -]*', term):
+        pattern = r'(?<![a-z0-9])' + re.escape(term) + r'(?![a-z0-9])'
+    elif exact_unicode:
+        pattern = r'(?<!\w)' + re.escape(term) + r'(?!\w)'
+    else:
+        pattern = re.escape(term)
+    return list(re.finditer(pattern, text, flags=re.UNICODE))
+
+def sino_watch_negative_terms_near_china(item, radius=260):
+    text = item_content_text(item)
+    china_spans = []
+    for term in SINO_WATCH_CHINA_LOWER:
+        china_spans.extend(sino_watch_term_spans(
+            text,
+            term,
+            exact_unicode=term in SINO_WATCH_CHINA_EXACT_TERMS,
+        ))
+    if not china_spans:
+        return set()
+    matched = set()
+    for span in china_spans:
+        window = text[max(0, span.start() - radius):span.end() + radius]
+        for term in SINO_WATCH_NEGATIVE_LOWER:
+            if sino_watch_term_spans(
+                window,
+                term,
+                exact_unicode=term in SINO_WATCH_NEGATIVE_EXACT_TERMS,
+            ):
+                matched.add(term)
+    return matched
+
+def sino_watch_is_positive_only(item):
+    text = item_content_text(item)
+    positive_hits = count_terms(text, SINO_WATCH_POSITIVE_ONLY_LOWER)
+    negative_hits = len(sino_watch_negative_terms_near_china(item))
+    return positive_hits > 0 and negative_hits == 0
+
+SINO_WATCH_DEPTH_TERMS = [
+    'analysis', 'investigation', 'in-depth', 'long read', 'report', 'study',
+    'policy brief', 'working paper', 'assessment', 'explainer', 'investigates',
+    '分析', '调查', '深度', '报告', '研究', '政策简报', '评估', '解释',
+    'анализ', 'исследован', 'расследован', 'доклад', 'отчёт', 'оценка',
+    'inceleme', 'analiz', 'rapor', 'araştırma',
+    'талдау', 'зерттеу', 'тергеу', 'есеп', 'бағалау',
+    'tahlil', 'tadqiqot', 'tekshiruv', 'hisobot', 'baholash',
+    'талдоо', 'иликтөө', 'баяндама', 'баалоо',
+    'таҳлил', 'таҳқиқ', 'гузориш', 'арзёбӣ', 'баррасӣ',
+    'derňew', 'barlag', 'hasabat', 'seljerme',
+]
+SINO_WATCH_DEPTH_LOWER = [term.lower() for term in SINO_WATCH_DEPTH_TERMS]
+
+SINO_WATCH_CATEGORY_RULES = [
+    ('环境、资源与社区冲突', ['pollution', 'contamination', 'environmental', 'water conflict', 'environmental damage', '污染', '环境', '水资源', 'загрязнен', 'эколог', 'çevre', 'kirlilik']),
+    ('劳工、就业与社会反应', ['chinese workers', 'labor dispute', 'labour dispute', 'jobs', 'wage', 'employment', '中国工人', '就业', '劳工', 'трудов', 'рабочие', 'занятость', 'işçi', 'istihdam']),
+    ('债务、合同与利益分配', ['debt', 'loan', 'contract', 'opaque', 'land grab', 'displacement', '债务', '贷款', '合同', '征地', '搬迁', 'долг', 'кредит', 'контракт', 'земл', 'borç', 'sözleşme']),
+    ('腐败、治理与责任追究', ['corruption', 'fraud', 'investigation', 'lawsuit', 'court', '腐败', '欺诈', '调查', '诉讼', '法院', 'коррупц', 'расследован', 'суд', 'yolsuzluk', 'soruşturma', 'dava']),
+    ('新疆、边境与权利议题', ['xinjiang', 'rights violation', 'surveillance', 'border', '新疆', '权利', '监控', '边境', 'синьцзян', 'нарушен прав', 'слежк', 'sınır', 'gözetim']),
+    ('抗议、抵制与政治叙事', ['protest', 'opposition', 'backlash', 'boycott', 'resentment', '抗议', '反对', '抵制', '不满', '反华', 'протест', 'оппозици', 'бойкот', 'недовольств', 'protesto', 'muhalefet', 'boykot']),
+]
+
+
+def sino_watch_signal_counts(item):
+    content = item_content_text(item)
+    if item.get('source_type') == 'sino_watch_local':
+        local_meta = sino_watch_local_meta(item.get('source', ''))
+        content = (content + ' ' + clean_text(local_meta.get('country', ''))).lower()
+    china_terms = [
+        term for term in SINO_WATCH_CHINA_LOWER
+        if term not in SINO_WATCH_CHINA_EXACT_TERMS
+    ]
+    exact_china_hits = sum(
+        1 for term in SINO_WATCH_CHINA_EXACT_TERMS
+        if re.search(r'(?<!\w)' + re.escape(term) + r'(?!\w)', content, flags=re.UNICODE)
+    )
+    return {
+        'china': count_terms(content, china_terms) + exact_china_hits,
+        'central_asia': count_terms(content, STRONG_CA_ANCHOR_LOWER),
+        'dispute': count_terms(content, SINO_WATCH_DISPUTE_LOWER),
+        'negative': len(sino_watch_negative_terms_near_china(item)),
+        'depth': count_terms(content, SINO_WATCH_DEPTH_LOWER),
+    }
+
+
+def sino_watch_international_source_base(source):
+    source = clean_text(source)
+    if '｜' in source:
+        return source.split('｜', 1)[0].strip()
+    if '|' in source:
+        return source.split('|', 1)[0].strip()
+    return source
+
+
+def sino_watch_international_source_family(source):
+    base = sino_watch_international_source_base(source)
+    if base in SINO_WATCH_INTERNATIONAL_MEDIA_SOURCES:
+        return '国际媒体与区域专业媒体'
+    if base in SINO_WATCH_INTERNATIONAL_RESEARCH_SOURCES:
+        return '国际智库与调查机构'
+    if base in SINO_WATCH_INTERNATIONAL_MULTILATERAL_SOURCES:
+        return '国际组织与多边机构'
+    if base in SINO_WATCH_INTERNATIONAL_NEIGHBOR_SOURCES:
+        return '周边国家与跨区域研究机构'
+    if base in ACADEMIC_SOURCE_NAMES:
+        return '高质量学术来源'
+    if base in SINO_WATCH_INTERNATIONAL_DISCOVERY_SOURCES:
+        surface = clean_text(source).lower()
+        if any(term in surface for term in [
+            'reuters', 'associated press', 'ap news', 'bbc', 'financial times',
+            'the economist', 'new york times', 'washington post', 'nikkei',
+            'the guardian', 'al jazeera', 'france 24', 'euronews', 'le monde',
+            'foreign policy', 'foreign affairs', 'the diplomat', 'eurasianet',
+            'times of central asia', 'cabar', 'iwpr', 'new lines',
+        ]):
+            return '国际媒体与区域专业媒体'
+        if any(term in surface for term in [
+            'world bank', 'international monetary fund', 'imf', 'adb', 'ebrd',
+            'oecd', 'united nations', 'unescap', 'unicef', 'iom', 'unodc',
+            'fao', 'osce', 'carec', 'unrcca',
+        ]):
+            return '国际组织与多边机构'
+        if any(term in surface for term in [
+            'carnegie', 'brookings', 'csis', 'chatham house', 'rusi',
+            'crisis group', 'sipri', 'iiss', 'rand', 'wilson center',
+            'kennan', 'fpri', 'merics', 'pism', 'ifri', 'ecfr', 'euiss',
+            'clingendael', 'ponars', 'freedom house', 'human rights watch',
+        ]):
+            return '国际智库与调查机构'
+        if neighboring_perspective_region(surface):
+            return '周边国家与跨区域研究机构'
+        return '国际深度发现入口'
+    if base.startswith('Deep Discovery: Google News'):
+        return '国际深度发现入口'
+    return '国际与跨区域其他来源'
+
+
+def is_sino_watch_international_source(item):
+    source = clean_text(item.get('source', ''))
+    base = sino_watch_international_source_base(source)
+    if base in SINO_WATCH_LOCAL_SOURCE_NAMES:
+        return False
+    return (
+        base in SINO_WATCH_INTERNATIONAL_SOURCE_NAMES
+        or base in SINO_WATCH_INTERNATIONAL_DISCOVERY_SOURCES
+        or base.startswith('Deep Discovery: Google News')
+    )
+
+
+def collect_sino_watch_international_items(all_items, existing_items=None):
+    """Reuse international records already fetched by the main pipeline.
+
+    The sidecar must see international reporting and institutional research,
+    but it should not make a second request to the same publisher. Copies are
+    annotated rather than mutating the main-pipeline records, because the
+    latter still feed the public-digest filters.
+    """
+    existing_keys = set()
+    for item in existing_items or []:
+        existing_keys.update(sino_watch_history_keys(item))
+    source_counts = {}
+    family_counts = {}
+    reused = []
+    for original in all_items or []:
+        if not is_sino_watch_international_source(original):
+            continue
+        source = clean_text(original.get('source', ''))
+        family = sino_watch_international_source_family(source)
+        source_counts[source] = source_counts.get(source, 0) + 1
+        family_counts[family] = family_counts.get(family, 0) + 1
+        keys = sino_watch_history_keys(original)
+        if keys & existing_keys:
+            continue
+        item = dict(original)
+        item['sino_watch_origin'] = 'international_main_pipeline'
+        item['sino_watch_source_type'] = 'sino_watch_international'
+        item['sino_watch_source_family'] = family
+        item['sino_watch_original_source_type'] = original.get('source_type', '')
+        if source in SINO_WATCH_INTERNATIONAL_TIER_ONE_SOURCES:
+            item['source_tier'] = 1
+        reused.append(item)
+        existing_keys.update(keys)
+    return reused, {
+        'source_counts': source_counts,
+        'family_counts': family_counts,
+        'reused_items': len(reused),
+    }
+
+
+def is_sino_watch_source_excluded(item):
+    surface = ' '.join([
+        clean_text(item.get('source', '')),
+        clean_text(item.get('publisher', '')),
+        clean_text(item.get('link', '')),
+    ]).lower()
+    return any(term in surface for term in SINO_WATCH_EXCLUDED_PUBLISHER_LOWER)
+
+
+def is_sino_watch_recent_item(item):
+    """Apply the short observation window used by the controversy sidecar.
+
+    The main digest deliberately admits durable institutional research, but an
+    everyday controversy monitor must not turn an old archive page into a
+    current negative-sentiment item.
+    """
+    item_date = parse_item_published_date(item)
+    if not item_date:
+        return False
+    age_days = (TODAY - item_date).days
+    return -1 <= age_days <= SINO_WATCH_LOOKBACK_DAYS
+
+
+def sino_watch_basic_candidate(item):
+    if not item or is_sino_watch_source_excluded(item):
+        return False
+    if not is_sino_watch_recent_item(item) or not has_verifiable_publication_time(item):
+        return False
+    signals = sino_watch_signal_counts(item)
+    if sino_watch_is_positive_only(item):
+        return False
+    return (
+        signals['china'] >= 1
+        and signals['central_asia'] >= 1
+        and signals['negative'] >= 1
+    )
+
+
+def is_sino_watch_candidate(item):
+    if not item or is_sino_watch_source_excluded(item):
+        return False
+    if not is_sino_watch_recent_item(item) or not has_verifiable_publication_time(item):
+        return False
+    if is_generic_item(item) or is_public_low_value(item) or is_news_aggregation_item(item):
+        return False
+    if is_event_or_conference_announcement(item):
+        return False
+    if sino_watch_is_positive_only(item):
+        return False
+    if is_official_activity_news(item) and not is_report_grade_item(item):
+        return False
+    signals = sino_watch_signal_counts(item)
+    if signals['china'] < 1 or signals['central_asia'] < 1 or signals['negative'] < 1:
+        return False
+    publisher = clean_text(item.get('publisher', '') or item.get('source', '')).lower()
+    trusted_source = (
+        int(item.get('source_tier', 3) or 3) <= 2
+        or any(term in publisher for term in SINO_WATCH_TRUSTED_PUBLISHER_LOWER)
+    )
+    if not trusted_source:
+        return False
+    summary_len = len(clean_text(item.get('summary', '')))
+    has_depth_evidence = (
+        signals['depth'] >= 1
+        or is_report_grade_item(item)
+        or item.get('source_type') == 'academic_paper'
+        or int(item.get('word_count', 0) or 0) >= 600
+        or summary_len >= 180
+    )
+    if not has_depth_evidence:
+        return False
+    if is_public_simple_news(item) and not (
+        is_report_grade_item(item)
+        or int(item.get('word_count', 0) or 0) >= 900
+        or summary_len >= 240
+    ):
+        return False
+    return True
+
+
+def sino_watch_rejection_reason(item):
+    if is_sino_watch_source_excluded(item):
+        return '社交平台或排除来源'
+    if not is_sino_watch_recent_item(item) or not has_verifiable_publication_time(item):
+        return '日期缺失或超出时效窗口'
+    if is_generic_item(item) or is_public_low_value(item) or is_news_aggregation_item(item):
+        return '泛化、低价值或聚合内容'
+    if is_event_or_conference_announcement(item):
+        return '活动或会议通知'
+    if sino_watch_is_positive_only(item):
+        return '正面合作或一般往来消息'
+    if is_official_activity_news(item) and not is_report_grade_item(item):
+        return '一般官方活动新闻'
+    signals = sino_watch_signal_counts(item)
+    if signals['china'] < 1 or signals['central_asia'] < 1 or signals['negative'] < 1:
+        return '三项核心信号不完整'
+    publisher = clean_text(item.get('publisher', '') or item.get('source', '')).lower()
+    trusted_source = (
+        int(item.get('source_tier', 3) or 3) <= 2
+        or any(term in publisher for term in SINO_WATCH_TRUSTED_PUBLISHER_LOWER)
+    )
+    if not trusted_source:
+        return '来源信誉不足'
+    summary_len = len(clean_text(item.get('summary', '')))
+    has_depth_evidence = (
+        signals['depth'] >= 1
+        or is_report_grade_item(item)
+        or item.get('source_type') == 'academic_paper'
+        or int(item.get('word_count', 0) or 0) >= 600
+        or summary_len >= 180
+    )
+    if not has_depth_evidence:
+        return '原文深度证据不足'
+    if is_public_simple_news(item) and not (
+        is_report_grade_item(item)
+        or int(item.get('word_count', 0) or 0) >= 900
+        or summary_len >= 240
+    ):
+        return '普通新闻而非深度材料'
+    return ''
+
+
+def sino_watch_score(item):
+    signals = sino_watch_signal_counts(item)
+    score = (
+        signals['china'] * 8
+        + signals['central_asia'] * 6
+        + signals['dispute'] * 10
+        + signals['depth'] * 4
+        + min(int(item.get('word_count', 0) or 0) // 250, 8)
+    )
+    score += {1: 24, 2: 15, 3: 5}.get(int(item.get('source_tier', 3) or 3), 0)
+    if is_report_grade_item(item):
+        score += 12
+    if item.get('summary_enriched'):
+        score += 8
+    return score
+
+
+def sino_watch_category(item):
+    content = item_content_text(item)
+    ranked = []
+    for label, terms in SINO_WATCH_CATEGORY_RULES:
+        hits = count_terms(content, [term.lower() for term in terms])
+        if hits:
+            ranked.append((hits, label))
+    ranked.sort(key=lambda pair: (-pair[0], pair[1]))
+    return ranked[0][1] if ranked else '涉华争议性议题'
+
+
+def sino_watch_history_keys(item):
+    keys = set()
+    link = normalize_history_link(item.get('link', ''))
+    if link:
+        keys.add('url:' + link)
+    title_key = normalize_title_key(clean_history_title(item.get('title', '')))
+    if title_key:
+        keys.add('title:' + title_key)
+    core_sig = title_core_signature_key(item.get('title', ''))
+    if core_sig:
+        keys.add(core_sig)
+    return keys
+
+
+def load_sino_watch_history():
+    if not SINO_WATCH_HISTORY_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(SINO_WATCH_HISTORY_FILE.read_text(encoding='utf-8'))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_sino_watch_history(history):
+    try:
+        atomic_write_json(SINO_WATCH_HISTORY_FILE, history)
+    except Exception:
+        pass
+
+
+def prune_sino_watch_history(history):
+    cutoff = TODAY - datetime.timedelta(days=SINO_WATCH_HISTORY_DAYS)
+    kept = {}
+    for date_text, keys in (history or {}).items():
+        try:
+            date_value = datetime.date.fromisoformat(str(date_text))
+        except Exception:
+            continue
+        if cutoff <= date_value <= TODAY and isinstance(keys, list):
+            kept[str(date_value)] = sorted(set(str(key) for key in keys if key))
+    return kept
+
+def sino_watch_prior_keys(history):
+    keys = set()
+    today_text = str(TODAY)
+    for date_text, date_keys in (history or {}).items():
+        if date_text == today_text:
+            continue
+        keys.update(date_keys)
+    return keys
+
+
+def load_sino_watch_lead_history():
+    if not SINO_WATCH_LEAD_HISTORY_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(SINO_WATCH_LEAD_HISTORY_FILE.read_text(encoding='utf-8'))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_sino_watch_lead_history(history):
+    try:
+        atomic_write_json(SINO_WATCH_LEAD_HISTORY_FILE, history)
+    except Exception:
+        pass
+
+
+def prune_sino_watch_lead_history(history):
+    cutoff = TODAY - datetime.timedelta(days=SINO_WATCH_LEAD_HISTORY_DAYS)
+    kept = {}
+    for date_text, keys in (history or {}).items():
+        try:
+            date_value = datetime.date.fromisoformat(str(date_text))
+        except Exception:
+            continue
+        if cutoff <= date_value <= TODAY and isinstance(keys, list):
+            kept[str(date_value)] = sorted(set(str(key) for key in keys if key))
+    return kept
+
+
+def sino_watch_lead_prior_keys(history):
+    keys = set()
+    today_text = str(TODAY)
+    for date_text, date_keys in (history or {}).items():
+        if date_text == today_text:
+            continue
+        keys.update(date_keys)
+    return keys
+
+
+def sino_watch_evidence_label(item):
+    if item.get('source_type') == 'academic_paper' or is_report_grade_item(item) or int(item.get('source_tier', 3) or 3) == 1:
+        return '较强：报告、学术论文或高权威来源证据'
+    if int(item.get('word_count', 0) or 0) >= 900 or item.get('summary_enriched'):
+        return '中等：已有较完整报道或原文摘要'
+    return '待核验：需寻找第二独立来源和一手文件'
+
+
+def sino_watch_research_note(item):
+    category = sino_watch_category(item)
+    notes = {
+        '环境、资源与社区冲突': '关注中资项目与地方资源、生态和社区利益之间的冲突，不将报道中的指控直接当作已证实事实。',
+        '劳工、就业与社会反应': '关注中国企业、劳务结构与本地就业之间的分配关系，需结合企业信息和当地劳动数据核验。',
+        '债务、合同与利益分配': '关注项目融资、合同透明度和地方利益分配，适合进一步寻找贷款、招标和项目执行文件。',
+        '腐败、治理与责任追究': '关注涉华项目中的监管、责任和利益输送争议，必须区分调查事实、政治指控与媒体推测。',
+        '新疆、边境与权利议题': '关注涉疆、跨境联系和数字治理等议题的地方叙事，原则上需要多语种来源和一手材料交叉核验。',
+        '抗议、抵制与政治叙事': '关注争议如何被地方政治力量和社会组织重新表述，不能把单一账号或单篇报道视为社会共识。',
+    }
+    return notes.get(category, '作为涉华争议性议题线索，需结合独立来源、官方回应和原始文件进一步核验。')
+
+
+def make_sino_watch_record(item, rank):
+    title = clean_title(item.get('title', ''))
+    title_cn = item_title_cn(item)
+    summary = item_summary_cn(item, 240)
+    raw_summary = clean_text(item.get('summary', ''))
+    if not summary and raw_summary and not summary_context_mismatch(title, raw_summary):
+        summary = trim_text(translate_text(raw_summary), 240)
+    signals = sino_watch_signal_counts(item)
+    return {
+        'rank': rank,
+        'title': title,
+        'title_cn': title_cn,
+        'source': clean_text(item.get('source', '')),
+        'publisher': clean_text(item.get('publisher', '')),
+        'link': clean_text(item.get('link', '')),
+        'published': clean_text(item.get('published', '')),
+        'category': sino_watch_category(item),
+        'evidence_level': sino_watch_evidence_label(item),
+        'status': '可进入专题候选' if sino_watch_evidence_label(item).startswith(('较强', '中等')) else '需要交叉核验',
+        'summary_cn': summary,
+        'research_note': sino_watch_research_note(item),
+        'signals': signals,
+        'source_tier': int(item.get('source_tier', 3) or 3),
+        'word_count': int(item.get('word_count', 0) or 0),
+    }
+
+
+def write_sino_watch_outputs(items, stats):
+    records = [make_sino_watch_record(item, index) for index, item in enumerate(items, start=1)]
+    payload = {
+        'pipeline_version': PIPELINE_VERSION,
+        'date': str(TODAY),
+        'scope': '自动监测公开网页中的中亚涉华负面、争议性或利益冲突议题线索，不等同于事实认定或社会民意测量。',
+        'stats': stats,
+        'items': records,
+    }
+    atomic_write_json(SINO_WATCH_JSON_FILE, payload)
+    lines = [
+        '# 中亚涉华负面舆情研究监测',
+        '',
+        '**日期**：' + TODAY.strftime('%Y年%m月%d日'),
+        '',
+        '说明：本文件由每日简报程序旁路自动生成，只记录经过初步筛选的中亚涉华负面、争议性或利益冲突议题。它不是舆情排行榜，也不把单一来源的指控当作事实；正式研究和引用必须回到原文，并核对政府、企业或其他相关方回应。',
+        '',
+        '**自动筛选口径**：同时具备中国因素、中亚实质关联、明确负面或争议/利益冲突信号、可识别来源和最低深度证据；排除正面合作稿、普通互认/出口/签约消息、Facebook、Telegram 等社交平台碎片、普通快讯、活动稿、聚合摘要和无法核验日期的材料。',
+        '',
+        '## 今日排查结果',
+        '',
+    ]
+    if not records:
+        lines.append('今日没有新增达到自动筛选门槛的涉华负面或争议性议题线索。')
+        lines.append('')
+    else:
+        for record in records:
+            lines.append('### ' + str(record['rank']) + '. ' + record['title_cn'])
+            lines.append('')
+            lines.append('- 议题类别：' + record['category'])
+            lines.append('- 初步证据等级：' + record['evidence_level'])
+            lines.append('- 处理状态：' + record['status'])
+            lines.append('- 内容线索：' + (record['summary_cn'] or '原文摘要不足，需打开链接核验。'))
+            lines.append('- 研究提示：' + record['research_note'])
+            if record['title_cn'] != record['title']:
+                lines.append('- 原题：' + record['title'])
+            if record['published']:
+                lines.append('- 时间：' + record['published'])
+            lines.append('- 来源：' + (record['publisher'] or record['source']))
+            if record['link']:
+                lines.append('- 原文链接：' + record['link'])
+            lines.append('')
+    lines.extend([
+        '## 自动排查统计',
+        '',
+        '- 监测查询返回：' + str(stats.get('fetched', 0)) + ' 条；同时命中中国因素、中亚关联和明确负面/争议信号：' + str(stats.get('signal_pass', 0)) + ' 条。',
+        '- 原文富集候选：' + str(stats.get('prefiltered', 0)) + ' 条；通过来源与深度门槛：' + str(stats.get('quality_pass', 0)) + ' 条；跨日重复排除：' + str(stats.get('history_skipped', 0)) + ' 条；本轮重复排除：' + str(stats.get('same_run_skipped', 0)) + ' 条。',
+        '- 今日录入档案：' + str(len(records)) + ' 条；“0 条”表示没有新增达到门槛的线索，不表示没有抓取内容。',
+        '',
+        '本文件不进入公众号版主简报；主简报仍然只收录深度报告、政策分析、长篇调查和高质量学术成果。',
+        '',
+    ])
+    origin_counts = stats.get('origin_counts') or {}
+    if origin_counts:
+        origin_labels = {
+            'international_main_pipeline': '国际来源复用',
+            'local_source_head': '中亚五国本土源头',
+            'dedicated_sino_queries': '涉华专项发现查询',
+        }
+        lines.insert(-2, '- 来源层分布：' + '；'.join(
+            origin_labels.get(key, key) + ' ' + str(value) + ' 条'
+            for key, value in sorted(origin_counts.items(), key=lambda pair: (-pair[1], pair[0]))
+        ) + '。')
+    family_counts = stats.get('source_family_counts') or {}
+    if family_counts:
+        lines.insert(-2, '- 国际/跨区域来源门类：' + '；'.join(
+            str(key) + ' ' + str(value) + ' 条'
+            for key, value in sorted(family_counts.items(), key=lambda pair: (-pair[1], pair[0]))
+        ) + '。')
+    rejection_reasons = stats.get('rejection_reasons') or {}
+    if rejection_reasons:
+        lines.insert(-2, '- 未入档原因：' + '；'.join(
+            str(key) + ' ' + str(value) + ' 条'
+            for key, value in sorted(rejection_reasons.items(), key=lambda pair: (-pair[1], pair[0]))
+        ) + '。')
+    atomic_write_text(SINO_WATCH_FILE, '\n'.join(lines))
+    return records
+
+
+def make_sino_watch_lead_record(item, rank, rejection_reason):
+    record = make_sino_watch_record(item, rank)
+    record['status'] = '待核验：' + (rejection_reason or '尚未通过严格专题门槛')
+    record['strict_rejection_reason'] = rejection_reason or '尚未通过严格专题门槛'
+    return record
+
+
+def write_sino_watch_lead_outputs(items, stats):
+    records = [
+        make_sino_watch_lead_record(item, index, item.get('sino_watch_lead_rejection_reason', ''))
+        for index, item in enumerate(items, start=1)
+    ]
+    payload = {
+        'pipeline_version': PIPELINE_VERSION,
+        'date': str(TODAY),
+        'scope': '宽口径保存同时出现中国因素、中亚关联和负面/争议信号、但尚未通过严格来源或深度核验的待核验线索，不等同于事实认定或社会民意测量。',
+        'stats': stats,
+        'items': records,
+    }
+    atomic_write_json(SINO_WATCH_LEAD_POOL_JSON_FILE, payload)
+    lines = [
+        '# 中亚涉华负面舆情宽口径待核验线索池',
+        '',
+        '**日期**：' + TODAY.strftime('%Y年%m月%d日'),
+        '',
+        '说明：本文件保存已经同时出现中国因素、中亚关联和明确负面/争议信号，但尚未通过严格涉华专题档案门槛的线索。它用于扩大观察面和后续核验，不把单一来源、普通新闻或机器识别结果当作事实。',
+        '',
+        '**与严格档案的区别**：严格档案要求来源信誉、原文深度和研究价值同时达标；本线索池允许暂时保留来源信誉不足、深度证据不足或普通新闻体裁的材料，但仍排除社交平台碎片、正面合作稿、明显聚合内容和无法确认日期的条目。',
+        '',
+        '## 今日新增线索',
+        '',
+    ]
+    if not records:
+        lines.append('今日没有新增宽口径待核验线索。')
+        lines.append('')
+    else:
+        for record in records:
+            lines.append('### ' + str(record['rank']) + '. ' + record['title_cn'])
+            lines.append('')
+            lines.append('- 待核验原因：' + record['strict_rejection_reason'])
+            lines.append('- 议题类别：' + record['category'])
+            lines.append('- 内容线索：' + (record['summary_cn'] or '原文摘要不足，需打开链接核验。'))
+            if record['published']:
+                lines.append('- 时间：' + record['published'])
+            lines.append('- 来源：' + (record['publisher'] or record['source']))
+            if record['link']:
+                lines.append('- 原文链接：' + record['link'])
+            lines.append('')
+    lines.extend([
+        '## 宽口径排查统计',
+        '',
+        '- 同时命中中国因素、中亚关联和负面/争议信号：' + str(stats.get('signal_pass', 0)) + ' 条。',
+        '- 进入宽口径候选：' + str(stats.get('prefiltered', 0)) + ' 条；跨日重复排除：' + str(stats.get('history_skipped', 0)) + ' 条；本轮重复排除：' + str(stats.get('same_run_skipped', 0)) + ' 条。',
+        '- 今日新增待核验线索：' + str(len(records)) + ' 条。',
+        '- 严格门槛未通过原因：' + ('；'.join(
+            str(key) + ' ' + str(value) + ' 条'
+            for key, value in sorted((stats.get('rejection_reasons') or {}).items(), key=lambda pair: (-pair[1], pair[0]))
+        ) if stats.get('rejection_reasons') else '本期没有需要记录的严格门槛淘汰原因') + '。',
+        '',
+        '本线索池不进入公众号版主简报；正式研究和引用必须回到原文，并寻找第二独立来源或一手文件核验。',
+        '',
+    ])
+    atomic_write_text(SINO_WATCH_LEAD_POOL_FILE, '\n'.join(lines))
+    return records
+
+
+def run_sino_watch_pipeline(raw_items):
+    stats = {
+        'fetched': len(raw_items or []),
+        'signal_pass': 0,
+        'prefiltered': 0,
+        'quality_pass': 0,
+        'history_skipped': 0,
+        'same_run_skipped': 0,
+        'selected': 0,
+        'rejection_reasons': {},
+        'origin_counts': {},
+        'source_family_counts': {},
+    }
+    lead_stats = {
+        'signal_pass': 0,
+        'prefiltered': 0,
+        'history_skipped': 0,
+        'same_run_skipped': 0,
+        'selected': 0,
+        'rejection_reasons': {},
+    }
+    history = prune_sino_watch_history(load_sino_watch_history())
+    prior_keys = sino_watch_prior_keys(history)
+    lead_history = prune_sino_watch_lead_history(load_sino_watch_lead_history())
+    lead_prior_keys = sino_watch_lead_prior_keys(lead_history)
+    candidates = []
+    current_keys = set()
+    lead_candidates = []
+    lead_current_keys = set()
+    for item in raw_items or []:
+        if item.get('sino_watch_origin') == 'international_main_pipeline':
+            origin = 'international_main_pipeline'
+            family = item.get('sino_watch_source_family') or sino_watch_international_source_family(item.get('source', ''))
+        elif item.get('source_type') == 'sino_watch_local':
+            origin = 'local_source_head'
+            local_meta = sino_watch_local_meta(item.get('source', ''))
+            family = '中亚五国本土源头：' + clean_text(local_meta.get('country', ''))
+        else:
+            origin = 'dedicated_sino_queries'
+            family = '涉华专项发现查询'
+        stats['origin_counts'][origin] = stats['origin_counts'].get(origin, 0) + 1
+        stats['source_family_counts'][family] = stats['source_family_counts'].get(family, 0) + 1
+        refresh_item_evidence(item)
+        signals = sino_watch_signal_counts(item)
+        if signals['china'] >= 1 and signals['central_asia'] >= 1 and signals['negative'] >= 1:
+            stats['signal_pass'] += 1
+            lead_stats['signal_pass'] += 1
+        if not sino_watch_basic_candidate(item):
+            continue
+        stats['prefiltered'] += 1
+        lead_stats['prefiltered'] += 1
+        keys = sino_watch_history_keys(item)
+        # The lead pool has an independent history: a strict-archive hit from
+        # a previous day must not suppress a wider, still-unverified watch lead.
+        if keys & lead_prior_keys:
+            lead_stats['history_skipped'] += 1
+        elif keys & lead_current_keys:
+            lead_stats['same_run_skipped'] += 1
+        else:
+            lead_current_keys.update(keys)
+            lead_candidates.append(item)
+        if keys & prior_keys:
+            stats['history_skipped'] += 1
+            continue
+        if keys & current_keys:
+            stats['same_run_skipped'] += 1
+            continue
+        current_keys.update(keys)
+        candidates.append(item)
+    candidates.sort(key=lambda item: (-sino_watch_score(item), published_ordinal(item), clean_text(item.get('title', '')).lower()))
+    candidates = candidates[:SINO_WATCH_PRE_ENRICH_LIMIT]
+    lead_candidates.sort(key=lambda item: (-sino_watch_score(item), published_ordinal(item), clean_text(item.get('title', '')).lower()))
+    lead_candidates = lead_candidates[:SINO_WATCH_LEAD_PRE_ENRICH_LIMIT]
+    enrichment_items = []
+    enrichment_keys = set()
+    for item in candidates + lead_candidates:
+        identity = normalize_key(item) or normalize_history_link(item.get('link', ''))
+        if identity in enrichment_keys:
+            continue
+        enrichment_keys.add(identity)
+        enrichment_items.append(item)
+    if enrichment_items:
+        resolve_item_links(enrichment_items, label='sino watch candidates and lead pool')
+        enrich_items_for_output(enrichment_items, label='sino watch candidates and lead pool')
+        for item in enrichment_items:
+            refresh_item_evidence(item)
+    selected = []
+    final_keys = set()
+    for item in candidates:
+        rejection_reason = sino_watch_rejection_reason(item)
+        if rejection_reason:
+            reasons = stats['rejection_reasons']
+            reasons[rejection_reason] = reasons.get(rejection_reason, 0) + 1
+            continue
+        stats['quality_pass'] += 1
+        keys = sino_watch_history_keys(item)
+        if keys & prior_keys:
+            stats['history_skipped'] += 1
+            continue
+        if keys & final_keys:
+            stats['same_run_skipped'] += 1
+            continue
+        final_keys.update(keys)
+        selected.append(item)
+        if len(selected) >= SINO_WATCH_MAX_ITEMS:
+            break
+    stats['selected'] = len(selected)
+    if selected:
+        history[str(TODAY)] = sorted(final_keys)
+    else:
+        history.pop(str(TODAY), None)
+    save_sino_watch_history(prune_sino_watch_history(history))
+    selected_keys = set()
+    for item in selected:
+        selected_keys.update(sino_watch_history_keys(item))
+    lead_selected = []
+    lead_final_keys = set()
+    for item in lead_candidates:
+        rejection_reason = sino_watch_rejection_reason(item)
+        if not rejection_reason:
+            continue
+        keys = sino_watch_history_keys(item)
+        if keys & selected_keys:
+            continue
+        if keys & lead_final_keys:
+            lead_stats['same_run_skipped'] += 1
+            continue
+        lead_final_keys.update(keys)
+        item['sino_watch_lead_rejection_reason'] = rejection_reason
+        lead_stats['rejection_reasons'][rejection_reason] = lead_stats['rejection_reasons'].get(rejection_reason, 0) + 1
+        lead_selected.append(item)
+        if len(lead_selected) >= SINO_WATCH_LEAD_MAX_ITEMS:
+            break
+    lead_stats['selected'] = len(lead_selected)
+    if lead_selected:
+        lead_history[str(TODAY)] = sorted(lead_final_keys)
+    else:
+        lead_history.pop(str(TODAY), None)
+    save_sino_watch_lead_history(prune_sino_watch_lead_history(lead_history))
+    stats['lead_pool'] = lead_stats
+    write_sino_watch_outputs(selected, stats)
+    write_sino_watch_lead_outputs(lead_selected, lead_stats)
+    return stats
 
 # ================================================================
 #  分类逻辑
@@ -7118,18 +9925,31 @@ def trim_text(text, max_len=180):
     text = clean_text(text)
     if len(text) <= max_len:
         return text
-    return text[:max_len].rstrip(' ，,。.;；') + '……'
+    boundary_window = text[:max_len]
+    boundaries = [
+        match.end()
+        for match in re.finditer(r'[。！？!?](?:\s|$)', boundary_window)
+    ]
+    if boundaries:
+        boundary = boundaries[-1]
+        if boundary >= max_len * 0.55:
+            return text[:boundary].strip()
+    return text[:max_len].rstrip(' ，,。！？!?.;；') + '……'
 
 def item_title_cn(item):
     title = clean_title(item.get('title', ''))
     title = re.sub(
         r'\s*[-–—|]\s*(?:The Foreign Policy Centre|Foreign Policy Centre|'
         r'KAZAKHSTAN INSTITUTE FOR STRATEGIC STUDIES UNDER THE PRESIDENT OF THE REPUBLIC OF KAZAKHSTAN|'
-        r'Stimson Center|CSIS)\s*$',
+        r'Stimson Center|CSIS|The Oxus Society|Oxus Society|Brookings Institution|Brookings|'
+        r'Eurasia Review|The Times of Central Asia)\s*$',
         '',
         title,
         flags=re.I,
     ).strip()
+    # Keep document type in the metadata fields, not as stray English in the
+    # Chinese display title.
+    title = re.sub(r'\s*[-–—|]\s*(?:OpEd|Analysis)\s*$', '', title, flags=re.I).strip()
     title_key = title.lower().replace('–', '-').replace('—', '-')
     link_path = urllib.parse.urlparse(item.get('link', '') or '').path.lower()
     if 'joint-working-group-on-international-and-eu-water-diplomacy-in-focus-central-asia' in link_path:
@@ -7139,8 +9959,26 @@ def item_title_cn(item):
         title = "Charting Central Asia's Technological Renaissance and Future Potential"
         title_key = title.lower()
     overrides = {
+        'astana and almaty: central asia’s two-city advantage': '阿斯塔纳和阿拉木图：中亚的双城优势',
+        "astana and almaty: central asia's two-city advantage": '阿斯塔纳和阿拉木图：中亚的双城优势',
+        'iran sanctions reach beyond tehran: what’s at stake for central asia': '伊朗制裁超越德黑兰：中亚面临哪些风险',
+        "iran sanctions reach beyond tehran: what's at stake for central asia": '伊朗制裁超越德黑兰：中亚面临哪些风险',
         'retreating rights - kyrgyzstan: introduction': '权利倒退：吉尔吉斯斯坦导论',
         'numbers and destinies: lessons from the 2025 annual address': '数字与命运：2025年国情咨文的启示',
+        'as it turns 25, the shanghai cooperation organization reflects the new world order': '上海合作组织成立25周年：它折射出怎样的新世界秩序',
+        'eurasia’s shifting balance of influence: an opening for the united states?': '欧亚力量格局正在重塑：美国的机会窗口？',
+        'цикл в новых декорациях. как изменился узбекистан за 10 лет без каримова': '新场景下的循环：没有卡里莫夫的十年，乌兹别克斯坦发生了什么变化',
+        'неуслышанные: проблема равного доступа к образованию детей с нарушением слуха в школах казахстана и узбекистана': '未被听见：哈萨克斯坦和乌兹别克斯坦听障儿童的平等受教育问题',
+        'aitys(h) as a form of civic activism in kazakhstan and kyrgyzstan': '阿依特斯诗歌对唱：哈萨克斯坦和吉尔吉斯斯坦的公民行动形式',
+        'afghanistan critical minerals: can central asia help unlock them?': '阿富汗关键矿产：中亚能否帮助释放其开发潜力？',
+        'trans-caspian fiber optic cable - unpacked': '跨里海光纤电缆：进展、影响与待解问题',
+        '“a fourth political reset?”: an interview with kyrgyz political scientist emil dzhuraev': '“第四次政治重置？”：专访吉尔吉斯斯坦政治学家埃米尔·朱拉耶夫',
+        'central asia: facing radical islam': '中亚：面对激进伊斯兰主义',
+        "azerbaijan's pivot to central asia": '阿塞拜疆转向中亚',
+        'диалогтың қысқаша мазмұны: kazakhstan futures': '对话摘要：哈萨克斯坦未来情景',
+        'new oecd assessment reveals central asia’s student performance': '经合组织最新评估揭示中亚学生学业表现',
+        "new oecd assessment reveals central asia's student performance": '经合组织最新评估揭示中亚学生学业表现',
+        'why are egemen, qazaqstan tv, khabar a far more distant world than american magazine and french journalist for west kazakhs': '西哈萨克斯坦的信息距离：本国官方媒体为何不及欧美媒体贴近当地',
     }
     return overrides.get(title_key, translate_text(title))
 
@@ -7151,13 +9989,18 @@ def item_summary_cn(item, max_len=220):
         and 'recommendations for scaling-up nature-based solutions' in title_lowered
     ):
         return '报告聚焦中亚土地退化与气候压力，分析如何通过区域合作扩大基于自然的景观修复方案，特别是在共享流域和跨境生态廊道中提升社区、生态系统与基础设施韧性。'
-    summary = clean_rss_summary_html(item.get('summary', ''))
     title = clean_title(item.get('title', ''))
+    raw_summary = clean_rss_summary_html(item.get('summary', ''))
+    if summary_context_mismatch(title, raw_summary):
+        return ''
+    summary = normalize_summary_display_text(raw_summary, item)
     if not summary:
         # Last-resort clue from title framing, still better than empty.
         if any(term in title.lower() for term in ['analysis', 'expert views', 'report', 'study', 'brief']):
             return trim_text('原文从分析/报告视角讨论：' + title, max_len)
         return ''
+    if title and summary.lower().startswith(title.lower()):
+        summary = clean_text(summary[len(title):].lstrip(' :：-–—|'))
     # Drop summary that is basically the title plus publisher junk.
     summary_cmp = re.sub(r'\W+', '', summary.lower())
     title_cmp = re.sub(r'\W+', '', title.lower())
@@ -7165,11 +10008,29 @@ def item_summary_cn(item, max_len=220):
         return ''
     if len(summary) < 40 and title_cmp and title_cmp in summary_cmp:
         return ''
-    translated = translate_text(summary)
+    # First consult the raw-summary translation cache. Existing caches were
+    # built before metadata cleanup, so cleaning the translated result preserves
+    # those verified Chinese abstracts instead of falling back to English during
+    # offline re-screening. If no usable translation exists, translate the
+    # cleaned text and apply the same cleanup again.
+    translated_raw = manual_summary_translation_override(raw_summary) or translate_text(raw_summary)
+    translated = normalize_summary_display_text(translated_raw, item)
+    if (
+        not translated
+        or (re.search(r'[A-Za-zА-Яа-я]', translated) and not re.search(r'[\u4e00-\u9fff]', translated))
+    ) and summary != raw_summary:
+        translated = normalize_summary_display_text(
+            manual_summary_translation_override(summary) or translate_text(summary),
+            item,
+        )
     # If translation collapses into title-like noise, keep a trimmed original excerpt.
     if translated and title and normalize_title_key(translated) == normalize_title_key(title):
-        return trim_text(summary, max_len)
-    return trim_text(translated or summary, max_len)
+        translated = summary
+    display = trim_text(translated or summary, max_len)
+    if display and summary_needs_continuation_marker(raw_summary):
+        if not display.endswith(('……', '…', '...')) and not summary_has_terminal_punctuation(display):
+            display = display.rstrip(' ，,。！？!?;；:：') + '……'
+    return display
 
 def item_public_tags(item):
     return format_public_tags(tag_item(item))
@@ -7398,7 +10259,7 @@ def source_summary(items):
 def render_doubao_public_digest(
     deduped, deep_focus, policy_focus, cats,
     active_feeds, active_web, feed_jobs, web_jobs, candidate_web_jobs,
-    cross_day_skipped, internal_review_items
+    cross_day_skipped, internal_review_items, sino_watch_stats=None
 ):
     used_keys = set()
     published_items = []
@@ -7406,7 +10267,7 @@ def render_doubao_public_digest(
     active_feed_sources = sources_with_items(feed_jobs)
     active_web_sources = sources_with_items(web_jobs)
     candidate_active_sources = sources_with_items(candidate_web_jobs)
-    candidate_text = '；候选网页源 ' + str(candidate_active_sources) + '/' + str(len(CANDIDATE_WEB_SOURCES)) + ' 返回非空（尚未过滤）' if TEST_CANDIDATE_SOURCES else ''
+    candidate_text = '；候选网页源 ' + str(candidate_active_sources) + '/' + str(len(get_active_candidate_web_sources())) + ' 返回非空（尚未过滤）' if TEST_CANDIDATE_SOURCES else ''
     topic_focus = topic_overview(deduped)
     public_topics = format_public_tags(topic_focus)
 
@@ -7497,9 +10358,12 @@ def render_doubao_public_digest(
     lines.append('')
     lines.append('本期抓取范围：启用 ' + str(len(active_feeds)) + '/' + str(len(FEEDS)) + ' 个 RSS 源、' + str(len(active_web)) + '/' + str(len(WEB_SOURCES)) + ' 个网页源；有效返回：RSS ' + str(active_feed_sources) + '/' + str(len(active_feeds)) + '，网页 ' + str(active_web_sources) + '/' + str(len(active_web)) + candidate_text + '；跨日去重排除 ' + str(cross_day_skipped) + ' 条；公众号正文候选 ' + str(len(deduped)) + ' 条。')
     lines.append('')
-    if WECHAT_SAFE_MODE:
-        lines.append('公众号稳妥版：已将 ' + str(len(internal_review_items)) + ' 条不适合直接公开展开的研究线索移入内部备查文件 ' + INTERNAL_REVIEW_FILE.name + '。')
-        lines.append('')
+    retained_internal_review_items = [
+        item for item in internal_review_items
+        if normalize_key(item) not in {normalize_key(published_item) for published_item in published_items}
+    ]
+    lines.extend(format_auxiliary_statistics_lines(len(retained_internal_review_items), sino_watch_stats))
+    lines.append('')
     lines.append('说明：本简报为公开信息自动聚合与中文整理结果，机器翻译和自动分类可能存在偏差；涉及事实、数字、机构表述与敏感判断时，请以原文链接为准并进行人工核验。')
     lines.append('')
     lines.append('---')
@@ -7566,11 +10430,13 @@ def append_research_link_item(lines, item, item_no):
         kind_labels = {
             'research_analysis': '研究分析',
             'research_publication': '研究出版物',
+            'research_paper': '研究论文',
             'policy_brief': '政策简报',
             'policy_memo': '政策备忘录',
             'working_paper': '工作论文',
             'report': '研究报告',
             'research_report': '研究报告',
+            'analysis': '研究分析',
         }
         lines.append('- 来源机构：' + institution)
         lines.append('- 文献类型：' + kind_labels.get(publication_kind.lower(), publication_kind or '研究出版物'))
@@ -7815,7 +10681,8 @@ def blindspot_radar(deduped, internal_review_items, cross_day_skipped=0):
 def render_researcher_link_digest(
     deduped, deep_focus, policy_focus, cats,
     active_feeds, active_web, feed_jobs, web_jobs, candidate_web_jobs,
-    cross_day_skipped, internal_review_items, extra_source_jobs=None, recent_review_items=None
+    cross_day_skipped, internal_review_items, extra_source_jobs=None, recent_review_items=None,
+    rescreen_source_count=None, sino_watch_stats=None,
 ):
     extra_source_jobs = extra_source_jobs or []
     recent_review_items = recent_review_items or []
@@ -7826,16 +10693,24 @@ def render_researcher_link_digest(
     active_feed_sources = sources_with_items(feed_jobs)
     active_web_sources = sources_with_items(web_jobs)
     candidate_active_sources = sources_with_items(candidate_web_jobs)
+    archive_items = [item for item in deduped if is_long_term_research_item(item)]
+    current_items = [item for item in deduped if not is_long_term_research_item(item)]
+    current_deep_focus = [item for item in deep_focus if not is_long_term_research_item(item)]
+    current_policy_focus = [item for item in policy_focus if not is_long_term_research_item(item)]
+    current_econ = [item for item in cats.get('econ', []) if not is_long_term_research_item(item)]
+    current_diplomacy = [item for item in cats.get('diplomacy', []) if not is_long_term_research_item(item)]
+    current_local = [item for item in cats.get('local', []) if not is_long_term_research_item(item)]
+    current_think_tank = [item for item in cats.get('think_tank', []) if not is_long_term_research_item(item)]
     # On low-yield days the evidence should occupy the page, not boilerplate.
     # This estimate is deliberately conservative: it only counts current,
     # research-grade pools that can actually feed the public edition.
     estimated_public_count = len({
         normalize_key(item)
-        for item in (deep_focus + policy_focus + cats.get('econ', []) + cats.get('diplomacy', []))
+        for item in (current_items + current_deep_focus + current_policy_focus + current_econ + current_diplomacy)
         if is_research_grade_public_item(item)
     })
     compact_template = estimated_public_count <= 4
-    candidate_text = '；候选网页源 ' + str(candidate_active_sources) + '/' + str(len(CANDIDATE_WEB_SOURCES)) + ' 返回非空（尚未过滤）' if TEST_CANDIDATE_SOURCES else ''
+    candidate_text = '；候选网页源 ' + str(candidate_active_sources) + '/' + str(len(get_active_candidate_web_sources())) + ' 返回非空（尚未过滤）' if TEST_CANDIDATE_SOURCES else ''
     extra_text = extra_source_scope_text(extra_source_jobs)
     topic_focus = format_public_tags(topic_overview(deduped))
 
@@ -7845,17 +10720,19 @@ def render_researcher_link_digest(
     lines.append('')
     lines.append('**研究范围**：中亚五国及其跨境政治、经济、安全、社会与外部关系。')
     lines.append('**选编原则**：仅收录原文可访问、发布日期或正式报告年份可核验、具有实质中亚关联的报告、政策分析、学术论文和深度调查；不收普通快讯、活动稿、书评或仅有付费摘要的线索。')
-    lines.append('**时效口径**：普通深度分析原则上近 ' + str(MAX_ITEM_AGE_DAYS) + ' 日；顶级媒体、权威机构分析与正式报告可放宽至近 ' + str(MAX_DEEP_ANALYSIS_AGE_DAYS) + ' 日；长期研究按权威性、深度、可访问性和耐久性门禁择优追溯，最长近 ' + str(DURABLE_RESEARCH_MAX_AGE_DAYS // 365) + ' 年。所有材料均须此前未在简报出现。')
+    lines.append('**时效口径**：普通深度分析原则上近 ' + str(MAX_ITEM_AGE_DAYS) + ' 日；顶级媒体、权威机构分析与正式报告可放宽至近 ' + str(MAX_DEEP_ANALYSIS_AGE_DAYS) + ' 日；长期研究按权威性、正文深度、可访问性和耐久性门禁择优追溯，最长近 ' + str(DURABLE_RESEARCH_MAX_AGE_DAYS // 365) + ' 年；白名单学术论文近 ' + str(ACADEMIC_LOOKBACK_DAYS) + ' 日。所有材料均须此前未在简报出现。')
     if topic_focus:
         lines.append('**本期议题**：' + '、'.join(topic_focus[:5]) + '。')
     lines.append('**使用说明**：内容提要为自动整理，正式引用请回到原文或 DOI 页面核验。')
+    if RUNTIME.rescreen:
+        lines.append('**生成方式**：基于当日已抓取缓存按当前规则离线重筛，未重新联网。')
     lines.append('')
 
     normal_conversion_items = normal_public_conversion_pool(internal_review_items)
     cautious_conversion_items = cautious_public_conversion_pool(internal_review_items)
 
     recent_priority_pool = [
-        item for item in (deep_focus + policy_focus + cats.get('econ', []) + cats.get('diplomacy', []) + deduped)
+        item for item in (current_deep_focus + current_policy_focus + current_econ + current_diplomacy + current_items)
         if parse_item_published_date(item)
         and (TODAY - parse_item_published_date(item)).days <= MAX_SLOW_PUBLICATION_AGE_DAYS
     ]
@@ -7873,17 +10750,12 @@ def render_researcher_link_digest(
     )
     append_research_link_section(
         lines, '长期有效研究（首次收录）',
-        [
-            item for item in deduped
-            if item_age_days(item) is not None
-            and item_age_days(item) > MAX_SLOW_PUBLICATION_AGE_DAYS
-            and is_durable_research_grade(item)
-        ],
+        [item for item in archive_items if is_durable_research_grade(item)],
         used_keys, published_items, 4, source_counts,
         balance_core_pillars=True,
     )
     top_media_pool = [
-        item for item in (deep_focus + deduped)
+        item for item in (current_deep_focus + current_items)
         if is_top_tier_media_item(item) and is_strict_deep_public_item(item)
     ]
     append_research_link_section(
@@ -7898,7 +10770,7 @@ def render_researcher_link_digest(
     append_research_link_section(
         lines, '智库研究与深度分析',
         [
-            item for item in deep_focus + cats.get('think_tank', [])
+            item for item in current_deep_focus + current_think_tank + current_items
             if is_substantive_deep_item(item)
         ],
         used_keys, published_items, 10, source_counts
@@ -7907,13 +10779,13 @@ def render_researcher_link_digest(
     # daily edition never repeats an item that has appeared before.
     append_research_link_section(
         lines, '政策文件与官方数据',
-        [item for item in policy_focus + deduped + normal_conversion_items if is_policy_table_candidate(item)],
+        [item for item in current_policy_focus + current_items + normal_conversion_items if is_policy_table_candidate(item)],
         used_keys, published_items, 10, source_counts
     )
     append_research_link_section(
         lines, '经济、能源与互联互通',
         [
-            item for item in cats.get('econ', []) + deduped + normal_conversion_items
+            item for item in current_econ + current_items + normal_conversion_items
             if is_strict_deep_public_item(item)
             and not is_report_grade_item(item)
             and ('经济能源' in item_public_tags(item) or '水资源气候' in item_public_tags(item))
@@ -7923,7 +10795,7 @@ def render_researcher_link_digest(
     append_research_link_section(
         lines, '对外关系与区域合作',
         [
-            item for item in cats.get('diplomacy', []) + deduped + normal_conversion_items
+            item for item in current_diplomacy + current_items + normal_conversion_items
             if is_strict_deep_public_item(item)
             and not is_report_grade_item(item)
             and '对外关系' in item_public_tags(item)
@@ -7933,7 +10805,7 @@ def render_researcher_link_digest(
     append_research_link_section(
         lines, '本地观察与社会文化',
         [
-            item for item in cats.get('local', []) + deduped
+            item for item in current_local + current_items
             if is_strict_deep_public_item(item) and '社会文化' in item_public_tags(item)
         ],
         used_keys, published_items, 8, source_counts
@@ -7953,7 +10825,7 @@ def render_researcher_link_digest(
         pass
 
     report_meeting_academic_pool = [
-        item for item in deduped
+        item for item in current_items
         if (item.get('source') in PDF_REPORT_SOURCES
         or item.get('source') in REPORT_API_SOURCE_NAMES
         or item.get('source') in MEETING_MINUTES_SOURCES
@@ -7972,15 +10844,15 @@ def render_researcher_link_digest(
 
     append_public_conversion_section(lines, cautious_conversion_items, used_keys, published_items, source_counts)
 
-    append_research_shortfall_section(lines, deduped, used_keys, published_items, source_counts)
+    append_research_shortfall_section(lines, current_items, used_keys, published_items, source_counts)
 
     # A classified item can occasionally miss every themed section after page
     # enrichment changes its tags. Never let a non-empty, quality-gated pool
     # render as an empty daily brief: this is a presentation fallback only and
     # does not relax any source, depth, date, or history requirement.
-    if not published_items and deduped:
+    if not published_items and current_items:
         append_research_link_section(
-            lines, '本期合格研究', deduped,
+            lines, '本期合格研究', current_items,
             used_keys, published_items, 6, source_counts,
         )
 
@@ -7998,19 +10870,40 @@ def render_researcher_link_digest(
 
         lines.append('## 资料来源与使用说明')
         lines.append('')
-        lines.append('本期抓取范围：启用 ' + str(len(active_feeds)) + '/' + str(len(FEEDS)) + ' 个 RSS 源、' + str(len(active_web)) + '/' + str(len(WEB_SOURCES)) + ' 个网页源；有效返回：RSS ' + str(active_feed_sources) + '/' + str(len(active_feeds)) + '，网页 ' + str(active_web_sources) + '/' + str(len(active_web)) + candidate_text + extra_text + '；跨日去重排除 ' + str(cross_day_skipped) + ' 条；公众号正文候选 ' + str(len(deduped)) + ' 条；公开版推荐 ' + str(published_item_count(published_items)) + ' 条。')
-        lines.append('')
-    if WECHAT_SAFE_MODE:
-        lines.append('公众号稳妥版：已将 ' + str(len(retained_internal_review_items)) + ' 条不适合直接公开展开的研究线索移入内部备查文件 ' + INTERNAL_REVIEW_FILE.name + '。')
+        lines.append(format_public_statistics_line(
+            active_feed_sources=active_feed_sources,
+            active_feed_count=len(active_feeds),
+            total_feed_count=len(FEEDS),
+            active_web_sources=active_web_sources,
+            active_web_count=len(active_web),
+            total_web_count=len(WEB_SOURCES),
+            candidate_text=candidate_text,
+            extra_text=extra_text,
+            cross_day_skipped=cross_day_skipped,
+            public_candidate_count=len(deduped),
+            published_count=published_item_count(published_items),
+            rescreen=RUNTIME.rescreen,
+            rescreen_source_count=rescreen_source_count,
+        ))
         lines.append('')
     if compact_template:
         lines.append('**文献状态**：以上条目均为本轮首次公开推荐，不重复收录往期简报材料。')
-        lines.append('检索诊断：RSS 有效源 ' + str(active_feed_sources) + '/' + str(len(active_feeds))
-                     + '，网页有效源 ' + str(active_web_sources) + '/' + str(len(active_web))
-                     + '，当前候选 ' + str(len(deduped)) + ' 条，历史重复排除 '
-                     + str(cross_day_skipped) + ' 条；“0 条”仅表示本轮没有新的合格公开材料。')
+        lines.append(format_public_statistics_line(
+            active_feed_sources=active_feed_sources,
+            active_feed_count=len(active_feeds),
+            active_web_sources=active_web_sources,
+            active_web_count=len(active_web),
+            cross_day_skipped=cross_day_skipped,
+            public_candidate_count=len(deduped),
+            published_count=published_item_count(published_items),
+            compact=True,
+            rescreen=RUNTIME.rescreen,
+            rescreen_source_count=rescreen_source_count,
+        ))
     else:
-        lines.append('建议用法：公开版只放深度分析与达标学术论文；内部备查只放不宜公开的深度线索；普通新闻与非白名单论文不进入任一版本；正式引用前请打开原文/DOI 核验。')
+        lines.append('建议用法：公开版只放深度分析与达标学术论文；附属文件只放不宜公开的深度线索；普通新闻与非白名单论文不进入任一版本；正式引用前请打开原文/DOI 核验。')
+    lines.extend(format_auxiliary_statistics_lines(len(retained_internal_review_items), sino_watch_stats))
+    lines.append('')
     append_project_collaboration_note(lines)
     return lines, published_items
 
@@ -8018,11 +10911,26 @@ def render_researcher_link_digest(
 #  主函数
 # ================================================================
 def main():
-    global TRANSLATE_CACHE
+    global TRANSLATE_CACHE, SOURCE_MAINTENANCE_SUMMARY
     if RUNTIME.replay:
         replay_saved_render()
         return
+    if RUNTIME.rescreen:
+        rescreen_saved_selection()
+        return
+    SOURCE_MAINTENANCE_SUMMARY = run_source_maintenance_safely()
+    if SOURCE_MAINTENANCE_SUMMARY.get('error'):
+        print('  Maintenance warning: ' + SOURCE_MAINTENANCE_SUMMARY['error'])
+    print(
+        '  Maintenance: queue ' + str(SOURCE_MAINTENANCE_SUMMARY.get('queued', 0))
+        + ' | due ' + str(SOURCE_MAINTENANCE_SUMMARY.get('due', 0))
+        + ' | probes ' + str(SOURCE_MAINTENANCE_SUMMARY.get('probed', 0))
+        + ' | success ' + str(SOURCE_MAINTENANCE_SUMMARY.get('success', 0))
+        + ' | awaiting repair ' + str(SOURCE_MAINTENANCE_SUMMARY.get('awaiting_repair', 0))
+    )
     TRANSLATE_CACHE = load_translation_cache()
+    seen_history = load_seen_history()
+    prior_keys = prior_seen_keys(seen_history)
 
     local_kz = LOCAL_KZ
     local_uz = LOCAL_UZ
@@ -8043,11 +10951,12 @@ def main():
     print('  Date: ' + str(TODAY) + '  |  Stable mode: ' + ('ON' if STABLE_MODE else 'OFF'))
     print('  Active RSS: ' + str(len(active_feeds)) + '/' + str(len(FEEDS)) + '  |  Active Web: ' + str(len(active_web)) + '/' + str(len(WEB_SOURCES)))
     if TEST_CANDIDATE_SOURCES:
-        print('  Candidate Web: ' + str(len(CANDIDATE_WEB_SOURCES)))
+        print('  Candidate Web: ' + str(len(get_active_candidate_web_sources())) + '/' + str(len(CANDIDATE_WEB_SOURCES)))
     print('  Deep supplements: Telegram ' + ('ON ' if ENABLE_TELEGRAM_SOURCES else 'OFF ') + str(len(TELEGRAM_SOURCES)) + ' | Reports ' + str(len(PDF_REPORT_SOURCES) + len(REPORT_API_SOURCE_NAMES)) + ' | Meetings ' + str(len(MEETING_MINUTES_SOURCES)) + ' | Academic tasks ' + str(ACADEMIC_DAILY_TASK_COUNT))
     print('=' * 70)
     candidate_web_jobs = []
     extra_source_jobs = []
+    sino_watch_items = []
 
     print('\n[1/3] Fetching RSS feeds...')
     feed_jobs = []
@@ -8087,6 +10996,58 @@ def main():
     })
     print('  Deep-discovery queries with items: ' + str(jobs_with_items(deep_discovery_jobs)) + '/' + str(DEEP_DISCOVERY_TOTAL_TASKS))
 
+    if ENABLE_SINO_WATCH:
+        print('\n[1c/3] Fetching Sino-Central Asia controversy watch queries...')
+        sino_watch_jobs = []
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            future_map = {
+                executor.submit(fetch_feed, url, source_name, 'SINO_WATCH'): source_name
+                for source_name, urls in SINO_WATCH_DISCOVERY_SOURCES.items()
+                for url in urls
+            }
+            for future in as_completed(future_map):
+                source_name = future_map[future]
+                items = future.result()
+                sino_watch_items.extend(items)
+                sino_watch_jobs.append((source_name, len(items)))
+        extra_source_jobs.append({
+            'label': '涉华议题研究监测查询',
+            'kind': 'SINO_WATCH',
+            'jobs': sino_watch_jobs,
+            'total': SINO_WATCH_TOTAL_TASKS,
+        })
+        print('  Sino-watch queries with items: ' + str(jobs_with_items(sino_watch_jobs)) + '/' + str(SINO_WATCH_TOTAL_TASKS))
+
+        print('\n[1d/3] Fetching Central Asian local-language source-heads...')
+        sino_local_jobs = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_map = {
+                executor.submit(fetch_feed, url, source_name, 'SINO_WATCH_LOCAL'): source_name
+                for source_name, url in SINO_WATCH_LOCAL_FEEDS.items()
+            }
+            for future in as_completed(future_map):
+                source_name = future_map[future]
+                items = future.result()
+                sino_watch_items.extend(items)
+                sino_local_jobs.append((source_name, len(items)))
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_map = {
+                executor.submit(fetch_web, source_name, url, 'SINO_WATCH_LOCAL'): source_name
+                for source_name, url in SINO_WATCH_LOCAL_WEB_SOURCES.items()
+            }
+            for future in as_completed(future_map):
+                source_name = future_map[future]
+                items = future.result()
+                sino_watch_items.extend(items)
+                sino_local_jobs.append((source_name, len(items)))
+        extra_source_jobs.append({
+            'label': '中亚五国本国语言源头涉华监测',
+            'kind': 'SINO_WATCH_LOCAL',
+            'jobs': sino_local_jobs,
+            'total': len(SINO_WATCH_LOCAL_FEEDS) + len(SINO_WATCH_LOCAL_WEB_SOURCES),
+        })
+        print('  Local-language source-heads with items: ' + str(jobs_with_items(sino_local_jobs)) + '/' + str(len(SINO_WATCH_LOCAL_FEEDS) + len(SINO_WATCH_LOCAL_WEB_SOURCES)))
+
     print('\n[2/3] Scraping web sources...')
     web_jobs = []
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -8100,17 +11061,18 @@ def main():
     print('  Skipped web sources: ' + str(len(WEB_SOURCES) - len(active_web)))
     if TEST_CANDIDATE_SOURCES:
         print('\n[2b/3] Testing candidate web sources...')
+        active_candidate_web = get_active_candidate_web_sources()
         with ThreadPoolExecutor(max_workers=6) as executor:
             future_map = {
                 executor.submit(fetch_web, sn, url, 'CANDIDATE_WEB'): sn
-                for sn, url in CANDIDATE_WEB_SOURCES.items()
+                for sn, url in active_candidate_web.items()
             }
             for future in as_completed(future_map):
                 sn = future_map[future]
                 items = future.result()
                 all_items.extend(items)
                 candidate_web_jobs.append((sn, len(items)))
-        print('  Candidate web sources with items: ' + str(sources_with_items(candidate_web_jobs)) + '/' + str(len(CANDIDATE_WEB_SOURCES)))
+        print('  Candidate web sources with items: ' + str(sources_with_items(candidate_web_jobs)) + '/' + str(len(active_candidate_web)))
 
     if ENABLE_TELEGRAM_SOURCES:
         print('\n[2c/3] Fetching Telegram public preview sources...')
@@ -8138,7 +11100,7 @@ def main():
         pdf_report_jobs = []
         with ThreadPoolExecutor(max_workers=4) as executor:
             future_map = {
-                executor.submit(fetch_pdf_reports, sn, url): sn
+                executor.submit(fetch_pdf_reports, sn, url, 'PDF_REPORT', prior_keys): sn
                 for sn, url in PDF_REPORT_SOURCES.items()
             }
             for future in as_completed(future_map):
@@ -8211,6 +11173,7 @@ def main():
         print('\n[2f/3] Fetching quality academic paper signals...')
         reset_academic_fetch_diag()
         academic_jobs = []
+        academic_items = []
         academic_tasks = []
         # Primary: whitelist-journal targeted pulls (OpenAlex source IDs + Crossref ISSNs).
         academic_tasks.append(('OpenAlex-Whitelist', fetch_openalex_whitelist_sources, None))
@@ -8235,18 +11198,57 @@ def main():
                     record_source_warning('ACADEMIC', provider, query, exc)
                     items = []
                 all_items.extend(items)
+                academic_items.extend(items)
                 academic_jobs.append((provider + ': ' + query, len(items)))
+        academic_task_total = len(academic_tasks)
+        unseen_recent_academic = [
+            item for item in academic_items
+            if not (item_history_keys(item) & prior_keys)
+        ]
+        if not unseen_recent_academic:
+            print('  No unseen recent academic paper; trying durable quality backfill...')
+            backfill_items = fetch_durable_openalex_backfill(prior_keys)
+            all_items.extend(backfill_items)
+            academic_items.extend(backfill_items)
+            academic_jobs.append(('OpenAlex-Durable-Backfill', len(backfill_items)))
+            academic_task_total += 1
+            print('  Durable academic backfill items: ' + str(len(backfill_items)))
         extra_source_jobs.append({
             'label': '优质学术论文 OpenAlex+Crossref',
             'kind': 'ACADEMIC',
             'jobs': academic_jobs,
-            'total': len(academic_tasks),
+            'total': academic_task_total,
         })
-        print('  Quality academic searches with items: ' + str(jobs_with_items(academic_jobs)) + '/' + str(len(academic_tasks)))
+        print('  Quality academic searches with items: ' + str(jobs_with_items(academic_jobs)) + '/' + str(academic_task_total))
         print('  Academic gate diag: ' + ', '.join(
             key + '=' + str(ACADEMIC_FETCH_DIAG.get(key, 0))
             for key in ['api_results', 'pass', 'venue_not_whitelist', 'abstract_short', 'no_ca_anchor', 'errors', 'api_429_retry', 'api_success_after_429', 'api_final_429']
         ))
+
+    if ENABLE_SINO_WATCH:
+        international_reuse_items, international_reuse_audit = collect_sino_watch_international_items(
+            all_items,
+            existing_items=sino_watch_items,
+        )
+        sino_watch_items.extend(international_reuse_items)
+        international_reuse_jobs = sorted(
+            international_reuse_audit.get('source_counts', {}).items()
+        )
+        extra_source_jobs.append({
+            'label': '国际媒体、智库、多边机构与周边权威源复用',
+            'kind': 'SINO_WATCH_INTERNATIONAL',
+            'jobs': international_reuse_jobs,
+            'total': len(SINO_WATCH_INTERNATIONAL_SOURCE_NAMES),
+            'reuse_only': True,
+            'family_counts': international_reuse_audit.get('family_counts', {}),
+        })
+        print(
+            '  Reused international Sino-watch items: '
+            + str(len(international_reuse_items))
+            + ' from '
+            + str(len(international_reuse_jobs))
+            + ' source(s)'
+        )
 
     print('  Main source warnings recorded: ' + str(warning_count({'RSS', 'WEB'})))
     if TEST_CANDIDATE_SOURCES:
@@ -8276,6 +11278,16 @@ def main():
         relevant.extend(retained_cached_items)
         print('  Same-day live anchors: ' + str(anchored_live))
         print('  Restored fully qualified same-day selections: ' + str(len(retained_cached_items)))
+    else:
+        stale_cached_items = load_daily_selection_cache(allow_pipeline_mismatch=True)
+        retained_stale_items = []
+        for stale_item in stale_cached_items:
+            refresh_item_evidence(stale_item)
+            if is_research_grade_public_item(stale_item):
+                retained_stale_items.append(stale_item)
+        if retained_stale_items:
+            relevant.extend(retained_stale_items)
+            print('  Restored prior-pipeline same-day fallbacks without ranking anchors: ' + str(len(retained_stale_items)))
     # Async fetch completion order is nondeterministic. Put richer copies first so
     # same-run dedupe keeps the dated/full-summary version of a syndicated item.
     relevant.sort(key=lambda item: (
@@ -8289,8 +11301,6 @@ def main():
     print('  Total fetched: ' + str(len(all_items)))
     print('  Central Asia relevant: ' + str(len(relevant)))
 
-    seen_history = load_seen_history()
-    prior_keys = prior_seen_keys(seen_history)
     cross_day_skipped = 0
     same_run_skipped = 0
     deduped = []
@@ -8453,6 +11463,7 @@ def main():
 
     deduped.sort(key=lambda x: (
         *same_day_anchor_sort_key(x),
+        -research_freshness_bucket(x),
         -x.get('priority_score', 0),
         -x.get('depth_score', 0),
         -prestige_score(x),
@@ -8509,6 +11520,7 @@ def main():
     # the final history and public gates.
     all_deduped.sort(key=lambda x: (
         *same_day_anchor_sort_key(x),
+        -research_freshness_bucket(x),
         -x.get('priority_score', 0),
         -x.get('depth_score', 0),
         -prestige_score(x),
@@ -8562,33 +11574,6 @@ def main():
         and not is_institute_soft_content(item)
         and is_research_grade_public_item(item)
     ]
-    # If the strict public gate unexpectedly yields zero, retain a small,
-    # clearly logged reserve of newly discovered, open-access, high-authority
-    # research items. This prevents an adapter/gate mismatch from masquerading
-    # as a world-wide absence of Central Asia research.
-    if not deduped:
-        discovery_reserve = [
-            item for item in all_deduped
-            if item.get('source_tier', 3) <= 2
-            and item.get('access_status') not in {'paywalled', 'blocked'}
-            and item.get('link')
-            and is_new_discovery_item(item)
-            and has_strong_central_asia_anchor(item)
-            and not is_publication_risky(item)
-            and not is_public_low_value(item)
-            and not is_public_simple_news(item)
-            and not is_institute_soft_content(item)
-            and (is_deep_item(item) or is_report_grade_item(item) or is_substantive_policy_document(item))
-        ]
-        discovery_reserve.sort(key=lambda x: (
-            *same_day_anchor_sort_key(x),
-            -int(x.get('source_tier', 3)),
-            -x.get('depth_score', 0),
-            -published_ordinal(x),
-        ))
-        deduped = discovery_reserve[:5]
-        if deduped:
-            print('  Discovery reserve activated: ' + str(len(deduped)))
     # Recovery pass: candidates that were only short Google News blurbs may
     # become public-grade after original-page enrichment. Keep this pass
     # separate from the main pool so a ranking quirk cannot make the whole
@@ -8644,6 +11629,7 @@ def main():
     max_public_pool = min(15, max(max_public_pool, TARGET_PUBLIC_RECOMMENDATIONS))
     deduped.sort(key=lambda x: (
         *same_day_anchor_sort_key(x),
+        -research_freshness_bucket(x),
         -x.get('priority_score', 0),
         -x.get('depth_score', 0),
         -prestige_score(x),
@@ -8740,6 +11726,9 @@ def main():
     )
     recent_review_items = recent_review_items[:5]
     print('  Recent high-grade review items: ' + str(len(recent_review_items)))
+    sino_watch_stats = run_sino_watch_pipeline(sino_watch_items) if ENABLE_SINO_WATCH else None
+    if ENABLE_SINO_WATCH:
+        print('  Sino-watch screened: ' + str(sino_watch_stats.get('selected', 0)) + ' new item(s) -> ' + str(SINO_WATCH_FILE.name))
     near_misses = summarize_near_misses(low_research_public_items, limit=8)
     try:
         health_lines = []
@@ -8759,13 +11748,15 @@ def main():
             deduped, deep_focus, policy_focus, CATS,
             active_feeds, active_web, feed_jobs, web_jobs,
             candidate_web_jobs, cross_day_skipped, internal_review_items,
-            extra_source_jobs, recent_review_items
+            extra_source_jobs, recent_review_items,
+            sino_watch_stats=sino_watch_stats,
         )
     else:
         L, published_items = render_doubao_public_digest(
             deduped, deep_focus, policy_focus, CATS,
             active_feeds, active_web, feed_jobs, web_jobs,
-            candidate_web_jobs, cross_day_skipped, internal_review_items
+            candidate_web_jobs, cross_day_skipped, internal_review_items,
+            sino_watch_stats=sino_watch_stats,
         )
 
     rendered_markdown = '\n'.join(L)
@@ -8789,6 +11780,13 @@ def main():
         len(low_value_public_items),
         len(low_research_public_items),
     )
+    append_source_performance_to_health_log(
+        all_items,
+        relevant,
+        all_deduped,
+        deduped,
+        published_items,
+    )
     write_selection_audit(
         published_items,
         all_items=all_items,
@@ -8801,9 +11799,12 @@ def main():
     save_seen_history(seen_history, published_items)
     save_daily_selection_cache(published_items)
     save_translation_cache()
+    archived_paths = archive_old_outputs()
+    if archived_paths:
+        print('Archived ' + str(len(archived_paths)) + ' older output file(s) under ' + str(_archive_root()))
     print('\nDone! Saved: ' + str(OUTPUT_FILE))
     print('Internal review saved: ' + str(INTERNAL_REVIEW_FILE))
-    print('Total public items: ' + str(len(deduped)))
+    print('Published public items: ' + str(published_item_count(published_items)))
     # Summary printed above
     print("Done!")
 

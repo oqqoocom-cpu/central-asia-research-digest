@@ -19,15 +19,28 @@ config.json
 .daily_selection_*.json
 .daily_render_*.md
 candidate_source_history.json
+source_maintenance_state.json
+source_maintenance_*.log
 seen_item_history.json
 source_health_*.log
 selection_audit_*.json
+rescreen_audit_*.json
 *.tmp
 
 # Generated editions and internal working files
+一人实验室架构设计.md
+archive/
+00_今日入口.md
+00_今日入口.html
 CentralAsia_Research_*.md
 CentralAsia_Digest_*.md
 CentralAsia_Internal_Review_*.md
+Sino_CentralAsia_Watch_*.md
+sino_central_asia_watch_*.json
+sino_central_asia_watch_history.json
+Sino_CentralAsia_LeadPool_*.md
+sino_central_asia_lead_pool_*.json
+sino_central_asia_lead_history.json
 _test_*.txt
 _*_out.txt
 digest_run_*.log

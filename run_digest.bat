@@ -22,7 +22,8 @@ if not "%EXITCODE%"=="0" (
     exit /b %EXITCODE%
 )
 
-echo Done. Open the newest CentralAsia_Research_YYYY-MM-DD.md file in this folder.
+echo Done. The newest Markdown files remain in this folder for Mdnice editing.
+echo Older dated outputs are moved automatically into archive\YYYY\MM.
 echo.
 pause
 endlocal
